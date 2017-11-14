@@ -33,6 +33,7 @@ DPPO has a helper script to set off the worker threads
 - Python 3.5+
 - OpenAI Gym
 - TensorFlow 1.4
+- Numpy 1.13+
 
 DPPO was tested on a 16 core machine using CPU only, so the helper
 script will need to be updated for your particular setup.
