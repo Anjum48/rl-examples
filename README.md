@@ -10,6 +10,7 @@ time testing these in discrete domains such as Atari etc.
 
 ## Algorithms Implemented
 Thanks to DeepMind and OpenAI for making their research openly available.
+Big thanks also to the TensorFlow community.
 
 | Algorithm | arXiv Link                       | Paper                                                   | 
 | --------- | -------------------------------- | ------------------------------------------------------- |
