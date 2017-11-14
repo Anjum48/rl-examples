@@ -1,13 +1,13 @@
 # rl-examples
 Examples of published reinforcement learning algorithms in recent
-literature implemented in TensorFlow
+literature implemented in TensorFlow.
+Most of my research is in the continuous domain, and I haven't spent much
+time testing these in discrete domains such as Atari etc.
 
 ![PPO LSTM solving BipedalWalker-v2](https://github.com/Anjum48/rl-examples/blob/master/ppo/BipedalWalker_PPO-LSTM.gif)
 
 ## Algorithms Implemented
 Thanks to DeepMind and OpenAI for making their research openly available.
-Most of my research is in the continuous domain, and I haven't spent much
-time testing these in discrete domains such as Atari etc.
 
 | Algorithm | arXiv Link                       | Paper                                                   | 
 | --------- | -------------------------------- | ------------------------------------------------------- |
@@ -19,7 +19,7 @@ time testing these in discrete domains such as Atari etc.
 
 
 - GAE was used in all algorithms except for DPPG
-- Where possible, I've added LSTM layer to the policy and value functions
+- Where possible, I've added an LSTM layer to the policy and value functions
 this usually made the more complex environments more stable
 - DPPO is currently a bit unstable. Work in progress
 
@@ -37,4 +37,4 @@ DPPO has a helper script to set off the worker threads
 DPPO was tested on a 16 core machine using CPU only, so the helper
 script will need to be updated for your particular setup.
 For my setup, there was usually no speed advantage training on the 
-CPU vs GPU (GTX 1080), but your performance may differ,
+CPU vs GPU (GTX 1080), but your performance may differ
