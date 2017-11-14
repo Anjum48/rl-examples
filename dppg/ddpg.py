@@ -581,7 +581,7 @@ def main(_):
         # Start training given a session, environment, actor & critic
         train(sess, env, actor, critic, saver, replay_buffer)
         env.close()
-        # gym.upload(os.path.join(SUMMARY_DIR, ENVIRONMENT+'-experiment'), api_key='sk_fjbPP4esQeGGTPYRSmKnPA')
+        # gym.upload(os.path.join(SUMMARY_DIR, ENVIRONMENT+'-experiment'), api_key='XXXXXXXXXXXXXXXXXXXXXX')
 
 
 if __name__ == '__main__':
