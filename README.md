@@ -6,6 +6,8 @@ time testing these in discrete domains such as Atari etc.
 
 ![PPO LSTM solving BipedalWalker-v2](https://github.com/Anjum48/rl-examples/blob/master/ppo/BipedalWalker_PPO-LSTM.gif)
 
+*BipedalWalker-v2 solved using PPO with a LSTM layer*
+
 ## Algorithms Implemented
 Thanks to DeepMind and OpenAI for making their research openly available.
 
