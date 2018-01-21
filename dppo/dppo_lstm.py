@@ -25,9 +25,6 @@ ENVIRONMENT = 'Pendulum-v0'
 # ENVIRONMENT = 'BipedalWalker-v2'
 # ENVIRONMENT = 'BipedalWalkerHardcore-v2'
 
-PS = 0  # parameter servers
-N_WORKER = 16
-N_AGG = 12
 EP_MAX = 10000
 GAMMA = 0.99
 LAMBDA = 0.95
@@ -174,7 +171,7 @@ class Worker(object):
         self.env = gym.make(ENVIRONMENT)
 
         print("Starting Worker #{}".format(wid))
-        cluster = tf.train.ClusterSpec({#"ps": ["localhost:" + str(2222 + i) for i in range(PS)],
+        cluster = tf.train.ClusterSpec({"ps": ["localhost:" + str(2222 + i) for i in range(PS)],
                                         "worker": ["localhost:" + str(2222 + PS + i) for i in range(N_WORKER)]})
         self.server = tf.train.Server(cluster, job_name="worker", task_index=wid)
 
@@ -306,22 +303,18 @@ class Worker(object):
 
 
 if __name__ == '__main__':
-    # tf.app.run(main=start_parameter_server(0))
-
-    # from datetime import datetime
-    # N_WORKER = 1
-    # N_AGG = 1
-    # TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
-    # SUMMARY_DIR = os.path.join(OUTPUT_RESULTS_DIR, "DPPO_LSTM", ENVIRONMENT, TIMESTAMP)
-    # w = Worker(0)
-    # tf.app.run(main=w.work())
-
     parser = argparse.ArgumentParser()
     parser.add_argument('--job_name', action='store', dest='job_name', help='Either "ps" or "worker"')
     parser.add_argument('--task_index', action='store', dest='task_index', help='ID number of the job')
     parser.add_argument('--timestamp', action='store', dest='timestamp', help='Timestamp for output directory')
+    parser.add_argument('--workers', action='store', dest='n_workers', help='Number of workers')
+    parser.add_argument('--agg', action='store', dest='n_agg', help='Number of gradients to aggegate')
+    parser.add_argument('--ps', action='store', dest='ps', help='Number of parameter servers')
     args = parser.parse_args()
 
+    N_WORKER = int(args.n_workers)
+    N_AGG = int(args.n_agg)
+    PS = int(args.ps)
     TIMESTAMP = args.timestamp
     SUMMARY_DIR = os.path.join(OUTPUT_RESULTS_DIR, "DPPO_LSTM", ENVIRONMENT, TIMESTAMP)
 

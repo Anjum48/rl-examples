@@ -25,9 +25,6 @@ OUTPUT_RESULTS_DIR = "./"
 ENVIRONMENT = 'BipedalWalker-v2'
 # ENVIRONMENT = 'BipedalWalkerHardcore-v2'
 
-PS = 0  # parameter servers
-N_WORKER = 16  # parallel workers
-N_SYNC = 0.75
 EP_MAX = 100000
 GAMMA = 0.99
 LAMBDA = 0.95
@@ -86,8 +83,7 @@ class PPO(object):
 
         with tf.variable_scope('train'):
             opt = tf.train.AdamOptimizer(LR)
-            opt = tf.train.SyncReplicasOptimizer(opt, replicas_to_aggregate=int(N_WORKER*N_SYNC),
-                                                 total_num_replicas=N_WORKER)
+            opt = tf.train.SyncReplicasOptimizer(opt, replicas_to_aggregate=N_AGG, total_num_replicas=N_WORKER)
 
             grads, vs = zip(*opt.compute_gradients(self.loss))
             grads, _ = tf.clip_by_global_norm(grads, 5.0)
@@ -289,17 +285,18 @@ class Worker(object):
 
 
 if __name__ == '__main__':
-    # tf.app.run(main=start_parameter_server(0))
-
-    # w = Worker(0)
-    # tf.app.run(main=w.work())
-
     parser = argparse.ArgumentParser()
     parser.add_argument('--job_name', action='store', dest='job_name', help='Either "ps" or "worker"')
     parser.add_argument('--task_index', action='store', dest='task_index', help='ID number of the job')
     parser.add_argument('--timestamp', action='store', dest='timestamp', help='Timestamp for output directory')
+    parser.add_argument('--workers', action='store', dest='n_workers', help='Number of workers')
+    parser.add_argument('--agg', action='store', dest='n_agg', help='Number of gradients to aggegate')
+    parser.add_argument('--ps', action='store', dest='ps', help='Number of parameter servers')
     args = parser.parse_args()
 
+    N_WORKER = int(args.n_workers)
+    N_AGG = int(args.n_agg)
+    PS = int(args.ps)
     TIMESTAMP = args.timestamp
     SUMMARY_DIR = os.path.join(OUTPUT_RESULTS_DIR, "DPPO", ENVIRONMENT, TIMESTAMP)
 
