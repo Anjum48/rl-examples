@@ -14,13 +14,13 @@ time testing these in discrete domains such as Atari etc.
 Thanks to DeepMind and OpenAI for making their research openly available.
 Big thanks also to the TensorFlow community.
 
-| Algorithm | arXiv Link                       | Paper                                                   | 
-| --------- | -------------------------------- | ------------------------------------------------------- |
-| DPPG      | https://arxiv.org/abs/1509.02971 | Continuous control with deep reinforcement learning     |
-| A3C       | https://arxiv.org/abs/1602.01783 | Asynchronous Methods for Deep Reinforcement Learning    |
-| PPO       | https://arxiv.org/abs/1707.06347 | Proximal Policy Optimization Algorithms                 |
-| DPPO      | https://arxiv.org/abs/1707.02286 | Emergence of Locomotion Behaviours in Rich Environments |
-| GAE       | https://arxiv.org/abs/1506.02438 | High-Dimensional Continuous Control Using Generalized Advantage Estimation |
+| Algorithm | Paper                                                   | 
+| --------- | ------------------------------------------------------- |
+| DPPG      | [Continuous control with deep reinforcement learning](https://arxiv.org/abs/1509.02971)     |
+| A3C       | [Asynchronous Methods for Deep Reinforcement Learning](https://arxiv.org/abs/1602.01783)    |
+| PPO       | [Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347)                 |
+| DPPO      | [Emergence of Locomotion Behaviours in Rich Environments](https://arxiv.org/abs/1707.02286) |
+| GAE       | [High-Dimensional Continuous Control Using Generalized Advantage Estimation](https://arxiv.org/abs/1506.02438) |
 
 
 - GAE was used in all algorithms except for DPPG
