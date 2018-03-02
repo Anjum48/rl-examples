@@ -16,12 +16,13 @@ import os
 import scipy.signal
 from gym import wrappers
 from datetime import datetime
+from time import time
 OUTPUT_RESULTS_DIR = "./"
 
-ENVIRONMENT = 'Pendulum-v0'
+# ENVIRONMENT = 'Pendulum-v0'
 # ENVIRONMENT = 'MountainCarContinuous-v0'
 # ENVIRONMENT = 'LunarLanderContinuous-v2'
-# ENVIRONMENT = 'BipedalWalker-v2'
+ENVIRONMENT = 'BipedalWalker-v2'
 # ENVIRONMENT = 'BipedalWalkerHardcore-v2'
 
 EP_MAX = 10000
@@ -29,11 +30,12 @@ GAMMA = 0.99
 LAMBDA = 0.95
 ENTROPY_BETA = 0.0
 LR = 0.0001
-BATCH = 4096
-MINI_BATCH = 128
+BATCH = 8192
+MINIBATCH = 64
 EPOCHS = 10
 EPSILON = 0.2
-L2_REG = 0.01
+VF_COEFF = 1.0
+L2_REG = 0.001
 
 TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 SUMMARY_DIR = os.path.join(OUTPUT_RESULTS_DIR, "PPO", ENVIRONMENT, TIMESTAMP)
@@ -44,116 +46,116 @@ class PPO(object):
         self.s_dim, self.a_dim = environment.observation_space.shape[0], environment.action_space.shape[0]
         self.a_bound = environment.action_space.high
 
-        assert BATCH % MINI_BATCH == 0
-
-        config = tf.ConfigProto(device_count={'GPU': 0})
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+        config = tf.ConfigProto(log_device_placement=False, device_count={'GPU': 0})  # 1 for GPU, 0 for CPU
         self.sess = tf.Session(config=config)
-        self.state = tf.placeholder(tf.float32, [None, self.s_dim], 'state')  # TODO Normalise the state
+        self.state = tf.placeholder(tf.float32, [None, self.s_dim], 'state')
         self.actions = tf.placeholder(tf.float32, [None, self.a_dim], 'action')
         self.advantage = tf.placeholder(tf.float32, [None, 1], 'advantage')
         self.rewards = tf.placeholder(tf.float32, [None, 1], 'discounted_r')
 
-        pi, pi_params = self._build_anet('pi', trainable=True)
-        oldpi, oldpi_params = self._build_anet('oldpi', trainable=False)
+        self.dataset = tf.data.Dataset.from_tensor_slices({"state": self.state, "actions": self.actions,
+                                                           "rewards": self.rewards, "advantage": self.advantage})
+        self.dataset = self.dataset.shuffle(buffer_size=10000)
+        self.dataset = self.dataset.batch(MINIBATCH)
+        self.dataset = self.dataset.cache()
+        self.dataset = self.dataset.repeat(EPOCHS)
+        self.iterator = self.dataset.make_initializable_iterator()
+        batch = self.iterator.get_next()
 
-        self.v, vf_params = self._build_cnet("vf", trainable=True)
-        oldvf, oldvf_params = self._build_cnet('oldvf', trainable=False)
+        oldpi, oldpi_params = self._build_anet(batch["state"], 'oldpi')
+        pi, pi_params = self._build_anet(batch["state"], 'pi')
+        evalpi, _ = self._build_anet(self.state, 'pi', reuse=True)
 
-        self.sample_op = tf.squeeze(pi.sample(1), axis=0, name="sample_action")
+        self.v, vf_params = self._build_cnet(batch["state"], "vf")
+        self.evalvf, _ = self._build_cnet(self.state, 'vf', reuse=True)
 
-        with tf.variable_scope('update_old_functions'):
-            self.update_oldpi_op = [oldp.assign(p) for p, oldp in zip(pi_params, oldpi_params)]
-            self.update_oldvf_op = [oldp.assign(p) for p, oldp in zip(vf_params, oldvf_params)]
+        self.sample_op = tf.squeeze(evalpi.sample(1), axis=0, name="sample_action")
+        self.eval_action = evalpi.loc
+        self.global_step = tf.train.get_or_create_global_step()
 
         with tf.variable_scope('loss'):
             with tf.variable_scope('actor_loss'):
-                # self.ratio = pi.prob(self.actions) / tf.maximum(oldpi.prob(self.actions), 1e-8)
-                self.ratio = tf.maximum(pi.prob(self.actions), 1e-9) / tf.maximum(oldpi.prob(self.actions), 1e-9)
-                self.ratio = tf.clip_by_value(self.ratio, 0, 2)
-                surr1 = self.ratio * self.advantage
-                surr2 = tf.clip_by_value(self.ratio, 1 - EPSILON, 1 + EPSILON) * self.advantage
-                self.aloss = -tf.reduce_mean(tf.minimum(surr1, surr2))
+                ratio = tf.maximum(pi.prob(batch["actions"]), 1e-9) / tf.maximum(oldpi.prob(batch["actions"]), 1e-9)
+                ratio = tf.clip_by_value(ratio, 0, 10)
+                surr1 = ratio * batch["advantage"]
+                surr2 = tf.clip_by_value(ratio, 1 - EPSILON, 1 + EPSILON) * batch["advantage"]
+                aloss = -tf.reduce_mean(tf.minimum(surr1, surr2))
 
             with tf.variable_scope('critic_loss'):
-                self.closs = tf.reduce_mean(tf.square(self.v - self.rewards))
+                closs = tf.reduce_mean(tf.square(self.v - batch["rewards"])) * 0.5
 
             with tf.variable_scope('entropy_bonus'):
                 entropy = pi.entropy()
-                self.pol_entpen = -ENTROPY_BETA * tf.reduce_mean(entropy)
+                pol_entpen = -ENTROPY_BETA * tf.reduce_mean(entropy)
 
-            self.loss = self.aloss + self.closs + self.pol_entpen
+            self.loss = aloss + closs * VF_COEFF + pol_entpen
 
         with tf.variable_scope('train'):
             self.grads = tf.gradients(self.loss, pi_params + vf_params)
-            self.grads, _ = tf.clip_by_global_norm(self.grads, 5.0)
-            self.train_op = tf.train.AdamOptimizer(LR).apply_gradients(zip(self.grads, pi_params + vf_params))
+            self.grads, _ = tf.clip_by_global_norm(self.grads, 20.0)
+            self.train_op = tf.train.AdamOptimizer(LR).apply_gradients(zip(self.grads, pi_params + vf_params),
+                                                                       global_step=self.global_step)
 
-            # Separate actor/critic optimisers
-            a_opt = tf.train.AdamOptimizer(LR * 0.5)
-            c_opt = tf.train.AdamOptimizer(LR)
-            a_grads, a_vs = zip(*a_opt.compute_gradients(self.aloss, var_list=pi_params))
-            c_grads, c_vs = zip(*c_opt.compute_gradients(self.closs, var_list=vf_params))
-            a_grads, _ = tf.clip_by_global_norm(a_grads, 5.0)
-            c_grads, _ = tf.clip_by_global_norm(c_grads, 5.0)
-            self.atrain_op = a_opt.apply_gradients(zip(a_grads, a_vs))
-            self.ctrain_op = c_opt.apply_gradients(zip(c_grads, c_vs))
+        with tf.variable_scope('update_old_functions'):
+            self.update_oldpi_op = [oldp.assign(p) for p, oldp in zip(pi_params, oldpi_params)]
+            # self.update_oldvf_op = [oldp.assign(p) for p, oldp in zip(self.vf_params, self.oldvf_params)]
 
         self.writer = tf.summary.FileWriter(SUMMARY_DIR, self.sess.graph)
         self.sess.run(tf.global_variables_initializer())
 
-        tf.summary.scalar("Loss/Actor", self.aloss)
-        tf.summary.scalar("Loss/Critic", self.closs)
+        tf.summary.scalar("Loss/Actor", aloss)
+        tf.summary.scalar("Loss/Critic", closs)
         tf.summary.scalar("Value", tf.reduce_mean(self.v))
-        tf.summary.scalar("Ratio", tf.reduce_mean(self.ratio))
-        tf.summary.scalar("LogStd", tf.reduce_mean(pi.scale))
+        tf.summary.scalar("Ratio", tf.reduce_mean(ratio))
+        tf.summary.scalar("Sigma", tf.reduce_mean(pi.scale))
         self.summarise = tf.summary.merge(tf.get_collection(tf.GraphKeys.SUMMARIES))
 
-    def update(self, s, a, r, adv, copy_func=True):
-        if copy_func:
-            self.sess.run([self.update_oldpi_op, self.update_oldvf_op])
+    def update(self, s, a, r, adv):
+        start = time()
+        e_time = []
 
-        s_split = np.split(s, BATCH/MINI_BATCH)
-        a_split = np.split(a, BATCH/MINI_BATCH)
-        r_split = np.split(r, BATCH/MINI_BATCH)
-        adv_split = np.split(adv, BATCH/MINI_BATCH)
-        indexes = np.arange(BATCH/MINI_BATCH, dtype=int)
+        self.sess.run([self.update_oldpi_op, self.iterator.initializer],
+                      feed_dict={self.state: s, self.actions: a, self.rewards: r, self.advantage: adv})
 
-        for _ in range(EPOCHS):
-            # np.random.shuffle(indexes)  # uncomment this to shuffle the batches
-            for i in indexes:
-                self.sess.run(self.train_op, {self.state: s_split[i], self.actions: a_split[i],
-                                              self.advantage: adv_split[i], self.rewards: r_split[i]})
+        while True:
+            try:
+                e_start = time()
+                summary, step, _ = self.sess.run([self.summarise, self.global_step, self.train_op])
+                e_time.append(time() - e_start)
+            except tf.errors.OutOfRangeError:
+                break
+        print("Trained in %.3fs. Average %.3fs/batch. Global step %i" % (time() - start, np.mean(e_time), step))
+        return summary
 
-        return self.sess.run(self.summarise, {self.state: s, self.actions: a, self.advantage: adv, self.rewards: r})
-
-    def _build_anet(self, name, trainable):
+    def _build_anet(self, state_in, name, reuse=False):
         w_reg = tf.contrib.layers.l2_regularizer(L2_REG)
 
-        with tf.variable_scope(name):
-            l1 = tf.layers.dense(self.state, 400, tf.nn.relu, trainable=trainable,
-                                 kernel_regularizer=w_reg, name="pi_l1")
-            l2 = tf.layers.dense(l1, 400, tf.nn.relu, trainable=trainable, kernel_regularizer=w_reg, name="pi_l2")
-            mu = tf.layers.dense(l2, self.a_dim, tf.nn.tanh, trainable=trainable,
-                                 kernel_regularizer=w_reg, name="pi_mu_out")
-            log_sigma = tf.get_variable(name="pi_log_sigma_out", shape=self.a_dim, trainable=trainable,
-                                        initializer=tf.zeros_initializer(), regularizer=w_reg)
-            norm_dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.exp(log_sigma))
+        with tf.variable_scope(name, reuse=reuse):
+            l1 = tf.layers.dense(state_in, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l1")
+            l2 = tf.layers.dense(l1, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l2")
+            mu = tf.layers.dense(l2, self.a_dim, tf.nn.tanh, kernel_regularizer=w_reg, name="pi_mu")
+            sigma = tf.get_variable(name="pi_sigma", shape=self.a_dim, initializer=tf.ones_initializer())
+            norm_dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.maximum(sigma, 0.1))
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
         return norm_dist, params
 
-    def _build_cnet(self, name, trainable):
+    def _build_cnet(self, state_in, name, reuse=False):
         w_reg = tf.contrib.layers.l2_regularizer(L2_REG)
 
-        with tf.variable_scope(name):
-            l1 = tf.layers.dense(self.state, 400, tf.nn.relu, trainable=trainable,
-                                 kernel_regularizer=w_reg, name="vf_l1")
-            l2 = tf.layers.dense(l1, 400, tf.nn.relu, trainable=trainable, kernel_regularizer=w_reg, name="vf_l2")
-            vf = tf.layers.dense(l2, 1, trainable=trainable, kernel_regularizer=w_reg, name="vf_out")
+        with tf.variable_scope(name, reuse=reuse):
+            l1 = tf.layers.dense(state_in, 400, tf.nn.relu, kernel_regularizer=w_reg, name="vf_l1")
+            l2 = tf.layers.dense(l1, 400, tf.nn.relu, kernel_regularizer=w_reg, name="vf_l2")
+            vf = tf.layers.dense(l2, 1, kernel_regularizer=w_reg, name="vf_output")
+
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
         return vf, params
 
-    def eval_state(self, state):
-        action, value = self.sess.run([self.sample_op, self.v], {self.state: state[np.newaxis, :]})
+    def eval_state(self, state, stochastic=True):
+        if stochastic:
+            action, value = self.sess.run([self.sample_op, self.evalvf], {self.state: state[np.newaxis, :]})
+        else:
+            action, value = self.sess.run([self.eval_action, self.evalvf], {self.state: state[np.newaxis, :]})
         return action[0], value[0]
 
 
@@ -201,7 +203,7 @@ ppo = PPO(env)
 t = 0
 buffer_s, buffer_a, buffer_r, buffer_v, terminals = [], [], [], [], []
 
-for episode in range(EP_MAX):
+for episode in range(EP_MAX + 1):
     s = env.reset()
     ep_r, ep_t, terminal = 0, 0, True
     ep_a = []
@@ -209,7 +211,9 @@ for episode in range(EP_MAX):
     while True:
         a, v = ppo.eval_state(s)
 
-        if ep_t > 0 and (t % BATCH == 0 or terminal):
+        if ep_t > 0 and terminal:
+            print('Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
+
             v = [v[0] * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
             rewards = np.array(buffer_r)
             vpred = np.array(buffer_v + v)
@@ -223,27 +227,28 @@ for episode in range(EP_MAX):
             bs, ba, br, badv = np.vstack(buffer_s), np.vstack(buffer_a), np.vstack(tdlamret), np.vstack(advantage)
 
             # Update PPO
-            if t % BATCH == 0:
-                print("Training...")
+            if t >= BATCH:
+                print("Training using %i steps..." % t)
                 graph_summary = ppo.update(bs, ba, br, badv)
                 buffer_s, buffer_a, buffer_r, buffer_v, terminals = [], [], [], [], []
+                t = 0
 
             # End of episode summary
-            if terminal and ep_t > 0:
-                worker_summary = tf.Summary()
-                worker_summary.value.add(tag="Reward", simple_value=ep_r)
+            worker_summary = tf.Summary()
+            worker_summary.value.add(tag="Reward", simple_value=ep_r)
 
-                # Create Action histograms for each dimension
-                actions = np.array(ep_a)
-                for a in range(ppo.a_dim):
-                    add_histogram(ppo.writer, "Action/Dim" + str(a), actions[:, a], episode)
+            # Create Action histograms for each dimension
+            actions = np.array(ep_a)
+            for a in range(ppo.a_dim):
+                add_histogram(ppo.writer, "Action/Dim" + str(a), actions[:, a], episode)
 
-                graph_summary = ppo.sess.run(ppo.summarise, feed_dict={ppo.state: bs, ppo.actions: ba,
-                                                                       ppo.advantage: badv, ppo.rewards: br})
+            try:
                 ppo.writer.add_summary(graph_summary, episode)
-                ppo.writer.add_summary(worker_summary, episode)
-                ppo.writer.flush()
-                break
+            except NameError:
+                pass
+            ppo.writer.add_summary(worker_summary, episode)
+            ppo.writer.flush()
+            break
 
         buffer_s.append(s)
         buffer_a.append(a)
@@ -258,15 +263,18 @@ for episode in range(EP_MAX):
         ep_t += 1
         t += 1
 
-    print('Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
 env.close()
 
 env = gym.make(ENVIRONMENT)
 while True:
     s = env.reset()
+    ep_r, ep_t = 0, 0
     while True:
         env.render()
         a, v = ppo.eval_state(s)
         s, r, terminal, _ = env.step(np.clip(a, -ppo.a_bound, ppo.a_bound))
+        ep_r += r
+        ep_t += 1
         if terminal:
+            print("Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
             break
