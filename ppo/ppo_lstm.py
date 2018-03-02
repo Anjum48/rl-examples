@@ -1,5 +1,5 @@
 """
-A simple version of Proximal Policy Optimization (PPO) using single thread.
+A simple version of Proximal Policy Optimization (PPO) using single thread and an LSTM layer.
 
 Based on:
 1. Emergence of Locomotion Behaviours in Rich Environments (Google Deepmind): [https://arxiv.org/abs/1707.02286]
@@ -16,13 +16,14 @@ import os
 import scipy.signal
 from gym import wrappers
 from datetime import datetime
+from time import time
 OUTPUT_RESULTS_DIR = "./"
 
 # ENVIRONMENT = 'Pendulum-v0'
 # ENVIRONMENT = 'MountainCarContinuous-v0'
 # ENVIRONMENT = 'LunarLanderContinuous-v2'
-ENVIRONMENT = 'BipedalWalker-v2'
-# ENVIRONMENT = 'BipedalWalkerHardcore-v2'
+# ENVIRONMENT = 'BipedalWalker-v2'
+ENVIRONMENT = 'BipedalWalkerHardcore-v2'
 
 EP_MAX = 10000
 GAMMA = 0.99
@@ -30,10 +31,14 @@ LAMBDA = 0.95
 ENTROPY_BETA = 0.0
 LR = 0.0001
 BATCH = 8192
-CELL_SIZE = 128
+MINIBATCH = 64
 EPOCHS = 10
-EPSILON = 0.2
-L2_REG = 0.01
+EPSILON = 0.1
+VF_COEFF = 0.5
+L2_REG = 0.001
+LSTM_UNITS = 128
+LSTM_LAYERS = 1
+KEEP_PROB = 0.8
 
 TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 SUMMARY_DIR = os.path.join(OUTPUT_RESULTS_DIR, "PPO_LSTM", ENVIRONMENT, TIMESTAMP)
@@ -44,126 +49,164 @@ class PPO(object):
         self.s_dim, self.a_dim = environment.observation_space.shape[0], environment.action_space.shape[0]
         self.a_bound = environment.action_space.high
 
-        config = tf.ConfigProto(device_count={'GPU': 0})
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+        config = tf.ConfigProto(log_device_placement=False, device_count={'GPU': 0})  # 1 for GPU, 0 for CPU
         self.sess = tf.Session(config=config)
-        self.state = tf.placeholder(tf.float32, [None, self.s_dim], 'state')  # TODO Normalise the state
+        self.state = tf.placeholder(tf.float32, [None, self.s_dim], 'state')
         self.actions = tf.placeholder(tf.float32, [None, self.a_dim], 'action')
         self.advantage = tf.placeholder(tf.float32, [None, 1], 'advantage')
         self.rewards = tf.placeholder(tf.float32, [None, 1], 'discounted_r')
 
-        # Sneaky bug - new function needs to be created last so that the LSTM state ops are on the new network
-        oldpi, oldpi_params = self._build_anet('oldpi', trainable=False)
-        pi, pi_params = self._build_anet('pi', trainable=True)
+        self.is_training = tf.placeholder(tf.bool, name='training_flag')
+        self.keep_prob = tf.placeholder(tf.float32, name='dropout_keep_prob')
 
-        self.v, vf_params = self._build_cnet("vf", trainable=True)
+        # Use the TensorFlow Dataset API
+        self.dataset = tf.data.Dataset.from_tensor_slices({"state": self.state, "actions": self.actions,
+                                                           "rewards": self.rewards, "advantage": self.advantage})
+        self.dataset = self.dataset.batch(MINIBATCH)
+        self.iterator = self.dataset.make_initializable_iterator()
+        batch = self.iterator.get_next()
+        self.global_step = tf.train.get_or_create_global_step()
 
-        self.sample_op = tf.squeeze(pi.sample(1), axis=0, name="sample_action")
+        # Create an old & new policy function but also
+        # make separate value & policy functions for evaluation & training (with shared variables)
+        oldpi, oldpi_params, _, _ = self._build_anet(batch["state"], 'oldpi')
+        pi, pi_params, self.pi_i_state, self.pi_f_state = self._build_anet(batch["state"], 'pi')
+        evalpi, _, self.evalpi_i_state, self.evalpi_f_state = self._build_anet(self.state, 'pi', reuse=True, batch_size=1)
 
-        with tf.variable_scope('update_old_pi'):
-            self.update_oldpi_op = [oldp.assign(p) for p, oldp in zip(pi_params, oldpi_params)]
+        self.v, vf_params, self.vf_i_state, self.vf_f_state = self._build_cnet(batch["state"], "vf")
+        self.evalvf, _, self.evalvf_i_state, self.evalvf_f_state = self._build_cnet(self.state, 'vf', reuse=True, batch_size=1)
+
+        self.sample_op = tf.squeeze(evalpi.sample(1), axis=0, name="sample_action")
+        self.eval_action = evalpi.loc
 
         with tf.variable_scope('loss'):
             with tf.variable_scope('actor_loss'):
-                self.ratio = tf.maximum(pi.prob(self.actions), 1e-9) / tf.maximum(oldpi.prob(self.actions), 1e-9)
-                self.ratio = tf.clip_by_value(self.ratio, 0, 10)
-                surr1 = self.ratio * self.advantage
-                surr2 = tf.clip_by_value(self.ratio, 1 - EPSILON, 1 + EPSILON) * self.advantage
-                self.aloss = -tf.reduce_mean(tf.minimum(surr1, surr2))
+                # Use floor functions for the probabilities to prevent NaNs when prob = 0
+                ratio = tf.maximum(pi.prob(batch["actions"]), 1e-9) / tf.maximum(oldpi.prob(batch["actions"]), 1e-9)
+                ratio = tf.clip_by_value(ratio, 0, 10)  # If the ratio denominator is tiny, the ratio can explode
+                surr1 = ratio * batch["advantage"]
+                surr2 = tf.clip_by_value(ratio, 1 - EPSILON, 1 + EPSILON) * batch["advantage"]
+                a_loss = -tf.reduce_mean(tf.minimum(surr1, surr2))
 
             with tf.variable_scope('critic_loss'):
-                self.closs = tf.reduce_mean(tf.square(self.v - self.rewards))
+                c_loss = tf.reduce_mean(tf.square(self.v - batch["rewards"])) * 0.5
 
             with tf.variable_scope('entropy_bonus'):
                 entropy = pi.entropy()
-                self.pol_entpen = -ENTROPY_BETA * tf.reduce_mean(entropy)
+                pol_entpen = -ENTROPY_BETA * tf.reduce_mean(entropy)
 
-            self.loss = self.aloss + self.closs + self.pol_entpen
+            self.loss = a_loss + c_loss * VF_COEFF + pol_entpen
 
         with tf.variable_scope('train'):
             opt = tf.train.AdamOptimizer(LR)
             grads, vs = zip(*opt.compute_gradients(self.loss, var_list=pi_params + vf_params))
             # grads, _ = tf.clip_by_global_norm(grads, 50.0)
-            self.train_op = opt.apply_gradients(zip(grads, vs))
+            self.update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+            with tf.control_dependencies(self.update_ops):
+                self.train_op = opt.apply_gradients(zip(grads, vs), global_step=self.global_step)
 
-            # Separate actor/critic optimisers
-            a_opt = tf.train.AdamOptimizer(LR*0.5)
-            c_opt = tf.train.AdamOptimizer(LR)
-            a_grads, a_vs = zip(*a_opt.compute_gradients(self.aloss, var_list=pi_params))
-            c_grads, c_vs = zip(*c_opt.compute_gradients(self.closs, var_list=vf_params))
-
-            # a_grads, _ = tf.clip_by_global_norm(a_grads, 5.0)
-            # c_grads, _ = tf.clip_by_global_norm(c_grads, 5.0)
-            self.a_train_op = a_opt.apply_gradients(zip(a_grads, a_vs))
-            self.c_train_op = c_opt.apply_gradients(zip(c_grads, c_vs))
+        with tf.variable_scope('update_old_pi'):
+            self.update_oldpi_op = [oldp.assign(p) for p, oldp in zip(pi_params, oldpi_params)]
 
         self.writer = tf.summary.FileWriter(SUMMARY_DIR, self.sess.graph)
         self.sess.run(tf.global_variables_initializer())
 
-        tf.summary.scalar("Loss/Actor", self.aloss)
-        tf.summary.scalar("Loss/Critic", self.closs)
+        tf.summary.scalar("Loss/Actor", a_loss)
+        tf.summary.scalar("Loss/Critic", c_loss)
         tf.summary.scalar("Value", tf.reduce_mean(self.v))
-        tf.summary.scalar("Ratio", tf.reduce_mean(self.ratio))
-        tf.summary.scalar("LogStd", tf.reduce_mean(pi.scale))
+        tf.summary.scalar("Ratio", tf.reduce_mean(ratio))
+        tf.summary.scalar("Sigma", tf.reduce_mean(pi.scale))
         self.summarise = tf.summary.merge(tf.get_collection(tf.GraphKeys.SUMMARIES))
 
-    def _build_anet(self, name, trainable):
+    def _build_anet(self, state_in, name, reuse=False, batch_size=MINIBATCH):
         w_reg = tf.contrib.layers.l2_regularizer(L2_REG)
 
-        with tf.variable_scope(name):
-            a_lstm = tf.nn.rnn_cell.BasicLSTMCell(num_units=CELL_SIZE)
-            self.a_init_state = a_lstm.zero_state(batch_size=1, dtype=tf.float32)
-
-            l1 = tf.layers.dense(self.state, 400, tf.nn.relu, trainable=trainable, kernel_regularizer=w_reg, name="pi_l1")
-            l2 = tf.layers.dense(l1, 300, tf.nn.relu, trainable=trainable, kernel_regularizer=w_reg, name="pi_l2")
+        with tf.variable_scope(name, reuse=reuse):
+            l1 = tf.layers.dense(state_in, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l1")
+            l2 = tf.layers.dense(l1, LSTM_UNITS, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l2")
 
             # LSTM layer
-            a_outputs, self.a_final_state = tf.nn.dynamic_rnn(cell=a_lstm, inputs=tf.expand_dims(l2, axis=0),
-                                                              initial_state=self.a_init_state)
-            a_cell_out = tf.reshape(a_outputs, [-1, CELL_SIZE], name='flatten_lstm_outputs')
+            a_lstm = tf.nn.rnn_cell.BasicLSTMCell(num_units=LSTM_UNITS)
+            a_lstm = tf.nn.rnn_cell.DropoutWrapper(a_lstm, output_keep_prob=self.keep_prob)
+            a_lstm = tf.nn.rnn_cell.MultiRNNCell(cells=[a_lstm] * LSTM_LAYERS)
 
-            mu = tf.layers.dense(a_cell_out, self.a_dim, tf.nn.tanh, trainable=trainable,
-                                 kernel_regularizer=w_reg, name="pi_mu_out")
-            log_sigma = tf.get_variable(name="pi_log_sigma_out", shape=self.a_dim, trainable=trainable,
-                                        initializer=tf.zeros_initializer(), regularizer=w_reg)
-            norm_dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.exp(log_sigma))
+            a_init_state = a_lstm.zero_state(batch_size=batch_size, dtype=tf.float32)
+            lstm_in = tf.expand_dims(l2, axis=1)
+
+            a_outputs, a_final_state = tf.nn.dynamic_rnn(cell=a_lstm, inputs=lstm_in, initial_state=a_init_state)
+            a_cell_out = tf.reshape(a_outputs, [-1, LSTM_UNITS], name='flatten_lstm_outputs')
+
+            mu = tf.layers.dense(a_cell_out, self.a_dim, tf.nn.tanh, kernel_regularizer=w_reg, name="pi_mu")
+            sigma = tf.get_variable(name="pi_sigma", shape=self.a_dim, initializer=tf.ones_initializer())
+            norm_dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.maximum(sigma, 0.1))
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
-        return norm_dist, params
+        return norm_dist, params, a_init_state, a_final_state
 
-    def _build_cnet(self, name, trainable):
+    def _build_cnet(self, state_in, name, reuse=False, batch_size=MINIBATCH):
         w_reg = tf.contrib.layers.l2_regularizer(L2_REG)
 
-        with tf.variable_scope(name):
-            c_lstm = tf.nn.rnn_cell.BasicLSTMCell(num_units=CELL_SIZE)
-            self.c_init_state = c_lstm.zero_state(batch_size=1, dtype=tf.float32)
-
-            l1 = tf.layers.dense(self.state, 400, tf.nn.relu, trainable=trainable, kernel_regularizer=w_reg, name="vf_l1")
-            l2 = tf.layers.dense(l1, 300, tf.nn.relu, trainable=trainable, kernel_regularizer=w_reg, name="vf_l2")
+        with tf.variable_scope(name, reuse=reuse):
+            l1 = tf.layers.dense(state_in, 400, tf.nn.relu, kernel_regularizer=w_reg, name="vf_l1")
+            l2 = tf.layers.dense(l1, LSTM_UNITS, tf.nn.relu, kernel_regularizer=w_reg, name="vf_l2")
 
             # LSTM layer
-            c_outputs, self.c_final_state = tf.nn.dynamic_rnn(cell=c_lstm, inputs=tf.expand_dims(l2, axis=0),
-                                                              initial_state=self.c_init_state)
-            c_cell_out = tf.reshape(c_outputs, [-1, CELL_SIZE], name='flatten_lstm_outputs')
+            c_lstm = tf.nn.rnn_cell.BasicLSTMCell(num_units=LSTM_UNITS)
+            c_lstm = tf.nn.rnn_cell.DropoutWrapper(c_lstm, output_keep_prob=self.keep_prob)
+            c_lstm = tf.nn.rnn_cell.MultiRNNCell([c_lstm] * LSTM_LAYERS)
 
-            vf = tf.layers.dense(c_cell_out, 1, trainable=trainable, kernel_regularizer=w_reg, name="vf_out")
+            c_init_state = c_lstm.zero_state(batch_size=batch_size, dtype=tf.float32)
+            lstm_in = tf.expand_dims(l2, axis=1)
+
+            c_outputs, c_final_state = tf.nn.dynamic_rnn(cell=c_lstm, inputs=lstm_in, initial_state=c_init_state)
+            c_cell_out = tf.reshape(c_outputs, [-1, LSTM_UNITS], name='flatten_lstm_outputs')
+
+            vf = tf.layers.dense(c_cell_out, 1, kernel_regularizer=w_reg, name="vf_out")
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
-        return vf, params
+        return vf, params, c_init_state, c_final_state
 
     def update(self, exp):
+        start, e_time = time(), []
         self.sess.run([self.update_oldpi_op])
 
-        for k in range(EPOCHS):
-            # Best to do full episodes per batch
+        for _ in range(EPOCHS):
             for ep_s, ep_a, ep_r, ep_adv in exp:
-                a_state, c_state = self.sess.run([self.a_init_state, self.c_init_state])
-                _, a_state, c_state = self.sess.run([self.train_op, self.a_final_state, self.c_final_state],
-                                                    {self.state: ep_s, self.actions: ep_a,
-                                                     self.rewards: ep_r, self.advantage: ep_adv,
-                                                     self.a_init_state: a_state, self.c_init_state: c_state})
 
-    def eval_state(self, state, a_state, c_state):
-        a, v, a_state, c_state = self.sess.run([self.sample_op, self.v, self.a_final_state, self.c_final_state],
+                # Trim down to round minibatches
+                trim_index = (ep_s.shape[0] // MINIBATCH) * MINIBATCH
+                ep_s = ep_s[:trim_index]
+                ep_a = ep_a[:trim_index]
+                ep_r = ep_r[:trim_index]
+                ep_adv = ep_adv[:trim_index]
+
+                self.sess.run(self.iterator.initializer, feed_dict={self.state: ep_s, self.actions: ep_a,
+                                                                    self.rewards: ep_r, self.advantage: ep_adv})
+
+                a_state, c_state = self.sess.run([self.pi_i_state, self.vf_i_state])
+                train_ops = [self.summarise, self.global_step, self.pi_f_state, self.vf_f_state, self.train_op]
+
+                while True:
+                    try:
+                        e_start = time()
+                        feed_dict = {self.pi_i_state: a_state, self.vf_i_state: c_state, self.keep_prob: KEEP_PROB}
+                        summary, step, a_state, c_state, _ = self.sess.run(train_ops, feed_dict=feed_dict)
+                        e_time.append(time() - e_start)
+                    except tf.errors.OutOfRangeError:
+                        break
+
+        print("Trained in %.3fs. Average %.3fs/batch. Global step %i" % (time() - start, np.mean(e_time), step))
+        return summary
+
+    def eval_state(self, state, a_state, c_state, stochastic=True):
+        if stochastic:
+            eval_ops = [self.sample_op, self.evalvf, self.evalpi_f_state, self.evalvf_f_state]
+        else:
+            eval_ops = [self.eval_action, self.evalvf, self.evalpi_f_state, self.evalvf_f_state]
+
+        a, v, a_state, c_state = self.sess.run(eval_ops,
                                                {self.state: state[np.newaxis, :],
-                                                self.a_init_state: a_state, self.c_init_state: c_state})
+                                                self.evalpi_i_state: a_state, self.evalvf_i_state: c_state,
+                                                self.keep_prob: 1.0})
         return a[0], v[0], a_state, c_state
 
 
@@ -212,9 +255,9 @@ t = 0
 buffer_s, buffer_a, buffer_r, buffer_v, terminals = [], [], [], [], []
 experience = []
 
-for episode in range(EP_MAX):
+for episode in range(EP_MAX + 1):
 
-    a_lstm_state, c_lstm_state = ppo.sess.run([ppo.a_init_state, ppo.c_init_state])  # Zero LSTM state at beginning
+    a_lstm_state, c_lstm_state = ppo.sess.run([ppo.evalpi_i_state, ppo.evalvf_i_state])  # Zero LSTM state at beginning
 
     s = env.reset()
     ep_r, ep_t, terminal = 0, 0, True
@@ -224,6 +267,8 @@ for episode in range(EP_MAX):
         a, v, a_lstm_state, c_lstm_state = ppo.eval_state(s, a_lstm_state, c_lstm_state)
 
         if ep_t > 0 and terminal:
+            print('Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
+
             v = [v[0] * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
             rewards = np.array(buffer_r)
             vpred = np.array(buffer_v + v)
@@ -234,32 +279,36 @@ for episode in range(EP_MAX):
             tdlamret = advantage + np.array(buffer_v)
             advantage = (advantage - advantage.mean()) / np.maximum(advantage.std(), 1e-6)
 
-            bs, ba, br, badv = np.vstack(buffer_s), np.vstack(buffer_a), np.vstack(tdlamret), np.vstack(advantage)
-            experience.append((bs, ba, br, badv))
+            if len(rewards) >= MINIBATCH:  # Ignore episodes shorter than a minibatch
+                bs, ba, br, badv = np.vstack(buffer_s), np.vstack(buffer_a), np.vstack(tdlamret), np.vstack(advantage)
+                experience.append((bs, ba, br, badv))
+            else:
+                t -= len(rewards)
+
             buffer_s, buffer_a, buffer_r, buffer_v, terminals = [], [], [], [], []
 
             # Update PPO
             if t >= BATCH:
                 print("Training using %i episodes and %i steps..." % (len(experience), t))
-                ppo.update(experience)
+                graph_summary = ppo.update(experience)
                 t, experience = 0, []
 
-            if terminal:
-                # End of episode summary
-                worker_summary = tf.Summary()
-                worker_summary.value.add(tag="Reward", simple_value=ep_r)
+            # End of episode summary
+            worker_summary = tf.Summary()
+            worker_summary.value.add(tag="Reward", simple_value=ep_r)
 
-                # Create Action histograms for each dimension
-                actions = np.array(ep_a)
-                for a in range(ppo.a_dim):
-                    add_histogram(ppo.writer, "Action/Dim" + str(a), actions[:, a], episode)
+            # Create Action histograms for each dimension
+            actions = np.array(ep_a)
+            for a in range(ppo.a_dim):
+                add_histogram(ppo.writer, "Action/Dim" + str(a), actions[:, a], episode)
 
-                graph_summary = ppo.sess.run(ppo.summarise, feed_dict={ppo.state: bs, ppo.actions: ba,
-                                                                       ppo.advantage: badv, ppo.rewards: br})
+            try:
                 ppo.writer.add_summary(graph_summary, episode)
-                ppo.writer.add_summary(worker_summary, episode)
-                ppo.writer.flush()
-                break
+            except NameError:
+                pass
+            ppo.writer.add_summary(worker_summary, episode)
+            ppo.writer.flush()
+            break
 
         buffer_s.append(s)
         buffer_a.append(a)
@@ -274,16 +323,19 @@ for episode in range(EP_MAX):
         ep_t += 1
         t += 1
 
-    print('Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
 env.close()
 
 env = gym.make(ENVIRONMENT)
 while True:
     s = env.reset()
-    a_lstm_state, c_lstm_state = ppo.sess.run([ppo.a_init_state, ppo.c_init_state])
+    ep_r, ep_t = 0, 0
+    a_lstm_state, c_lstm_state = ppo.sess.run([ppo.evalpi_i_state, ppo.evalvf_i_state])
     while True:
         env.render()
-        a, v, a_lstm_state, c_lstm_state = ppo.eval_state(s, a_lstm_state, c_lstm_state)
+        a, v, a_lstm_state, c_lstm_state = ppo.eval_state(s, a_lstm_state, c_lstm_state, stochastic=False)
         s, r, terminal, _ = env.step(np.clip(a, -ppo.a_bound, ppo.a_bound))
+        ep_r += r
+        ep_t += 1
         if terminal:
+            print("Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
             break
