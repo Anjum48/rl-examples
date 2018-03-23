@@ -75,27 +75,35 @@ class PPO(object):
         self.global_step = tf.train.get_or_create_global_step()
 
         with tf.variable_scope('loss'):
-            with tf.variable_scope('actor_loss'):
-                ratio = tf.maximum(pi.prob(batch["actions"]), 1e-9) / tf.maximum(oldpi.prob(batch["actions"]), 1e-9)
-                ratio = tf.clip_by_value(ratio, 0, 10)
-                surr1 = ratio * batch["advantage"]
-                surr2 = tf.clip_by_value(ratio, 1 - EPSILON, 1 + EPSILON) * batch["advantage"]
-                aloss = -tf.reduce_mean(tf.minimum(surr1, surr2))
+            with tf.variable_scope('policy'):
+                # Use floor functions for the probabilities to prevent NaNs when prob = 0
+                ratio = pi.prob(batch["actions"]) / tf.maximum(oldpi.prob(batch["actions"]), 1e-6)
+                surr1 = batch["advantage"] * ratio
+                surr2 = batch["advantage"] * tf.clip_by_value(ratio, 1 - EPSILON, 1 + EPSILON)
+                loss_pi = -tf.reduce_mean(tf.minimum(surr1, surr2))
+                tf.summary.scalar("loss", loss_pi)
+                # tf.summary.histogram("Ratio", ratio)
 
-            with tf.variable_scope('critic_loss'):
-                closs = tf.reduce_mean(tf.square(self.v - batch["rewards"])) * 0.5
+            with tf.variable_scope('value_function'):
+                loss_vf = tf.reduce_mean(tf.square(self.v - batch["rewards"])) * 0.5
+                tf.summary.scalar("loss", loss_vf)
 
             with tf.variable_scope('entropy_bonus'):
                 entropy = pi.entropy()
                 pol_entpen = -ENTROPY_BETA * tf.reduce_mean(entropy)
 
-            self.loss = aloss + closs * VF_COEFF + pol_entpen
+            self.loss = loss_pi + loss_vf * VF_COEFF + pol_entpen
+            tf.summary.scalar("total", self.loss)
 
         with tf.variable_scope('train'):
-            self.grads = tf.gradients(self.loss, pi_params + vf_params)
-            self.grads, _ = tf.clip_by_global_norm(self.grads, 20.0)
-            self.train_op = tf.train.AdamOptimizer(LR).apply_gradients(zip(self.grads, pi_params + vf_params),
-                                                                       global_step=self.global_step)
+            opt = tf.train.AdamOptimizer(LR)
+            grads, vs = zip(*opt.compute_gradients(self.loss, var_list=pi_params + vf_params))
+            # Need to split the two networks so that clip_by_global_norm works properly
+            pi_grads, pi_vs = grads[:len(pi_params)], vs[:len(pi_params)]
+            vf_grads, vf_vs = grads[len(pi_params):], vs[len(pi_params):]
+            # pi_grads, _ = tf.clip_by_global_norm(pi_grads, 10.0)
+            # vf_grads, _ = tf.clip_by_global_norm(vf_grads, 10.0)
+            self.train_op = opt.apply_gradients(zip(pi_grads + vf_grads, pi_vs + vf_vs), global_step=self.global_step)
 
         with tf.variable_scope('update_old_functions'):
             self.update_oldpi_op = [oldp.assign(p) for p, oldp in zip(pi_params, oldpi_params)]
@@ -104,10 +112,7 @@ class PPO(object):
         self.writer = tf.summary.FileWriter(SUMMARY_DIR, self.sess.graph)
         self.sess.run(tf.global_variables_initializer())
 
-        tf.summary.scalar("Loss/Actor", aloss)
-        tf.summary.scalar("Loss/Critic", closs)
         tf.summary.scalar("Value", tf.reduce_mean(self.v))
-        tf.summary.scalar("Ratio", tf.reduce_mean(ratio))
         tf.summary.scalar("Sigma", tf.reduce_mean(pi.scale))
         self.summarise = tf.summary.merge(tf.get_collection(tf.GraphKeys.SUMMARIES))
 

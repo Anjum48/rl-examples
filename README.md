@@ -26,7 +26,7 @@ Big thanks also to the TensorFlow community.
 - GAE was used in all algorithms except for DPPG
 - Where possible, I've added an LSTM layer to the policy and value functions.
 This usually made the more complex environments more stable (but slower)
-- DPPO is currently a bit unstable. Work in progress
+- DPPO is currently a bit unstable, but does work
 
 ## Training
 All the Python scripts are written as standalone scripts. Just run them

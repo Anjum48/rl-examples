@@ -22,8 +22,8 @@ OUTPUT_RESULTS_DIR = "./"
 # ENVIRONMENT = 'Pendulum-v0'
 # ENVIRONMENT = 'MountainCarContinuous-v0'
 # ENVIRONMENT = 'LunarLanderContinuous-v2'
-# ENVIRONMENT = 'BipedalWalker-v2'
-ENVIRONMENT = 'BipedalWalkerHardcore-v2'
+ENVIRONMENT = 'BipedalWalker-v2'
+# ENVIRONMENT = 'BipedalWalkerHardcore-v2'
 
 EP_MAX = 10000
 GAMMA = 0.99
@@ -33,7 +33,7 @@ LR = 0.0001
 BATCH = 8192
 MINIBATCH = 64
 EPOCHS = 10
-EPSILON = 0.1
+EPSILON = 0.2
 VF_COEFF = 0.5
 L2_REG = 0.001
 LSTM_UNITS = 128
@@ -56,8 +56,6 @@ class PPO(object):
         self.actions = tf.placeholder(tf.float32, [None, self.a_dim], 'action')
         self.advantage = tf.placeholder(tf.float32, [None, 1], 'advantage')
         self.rewards = tf.placeholder(tf.float32, [None, 1], 'discounted_r')
-
-        self.is_training = tf.placeholder(tf.bool, name='training_flag')
         self.keep_prob = tf.placeholder(tf.float32, name='dropout_keep_prob')
 
         # Use the TensorFlow Dataset API
@@ -81,30 +79,38 @@ class PPO(object):
         self.eval_action = evalpi.loc
 
         with tf.variable_scope('loss'):
-            with tf.variable_scope('actor_loss'):
+            with tf.variable_scope('policy'):
                 # Use floor functions for the probabilities to prevent NaNs when prob = 0
-                ratio = tf.maximum(pi.prob(batch["actions"]), 1e-9) / tf.maximum(oldpi.prob(batch["actions"]), 1e-9)
-                ratio = tf.clip_by_value(ratio, 0, 10)  # If the ratio denominator is tiny, the ratio can explode
-                surr1 = ratio * batch["advantage"]
-                surr2 = tf.clip_by_value(ratio, 1 - EPSILON, 1 + EPSILON) * batch["advantage"]
-                a_loss = -tf.reduce_mean(tf.minimum(surr1, surr2))
+                ratio = pi.prob(batch["actions"]) / tf.maximum(oldpi.prob(batch["actions"]), 1e-6)
+                surr1 = batch["advantage"] * ratio
+                surr2 = batch["advantage"] * tf.clip_by_value(ratio, 1 - EPSILON, 1 + EPSILON)
+                loss_pi = -tf.reduce_mean(tf.minimum(surr1, surr2))
+                tf.summary.scalar("loss", loss_pi)
+                # tf.summary.histogram("Ratio", ratio)
 
-            with tf.variable_scope('critic_loss'):
-                c_loss = tf.reduce_mean(tf.square(self.v - batch["rewards"])) * 0.5
+            with tf.variable_scope('value_function'):
+                loss_vf = tf.reduce_mean(tf.square(self.v - batch["rewards"])) * 0.5
+                tf.summary.scalar("loss", loss_vf)
 
             with tf.variable_scope('entropy_bonus'):
                 entropy = pi.entropy()
                 pol_entpen = -ENTROPY_BETA * tf.reduce_mean(entropy)
 
-            self.loss = a_loss + c_loss * VF_COEFF + pol_entpen
+            self.loss = loss_pi + loss_vf * VF_COEFF + pol_entpen
+            tf.summary.scalar("total", self.loss)
 
         with tf.variable_scope('train'):
             opt = tf.train.AdamOptimizer(LR)
             grads, vs = zip(*opt.compute_gradients(self.loss, var_list=pi_params + vf_params))
-            # grads, _ = tf.clip_by_global_norm(grads, 50.0)
-            self.update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-            with tf.control_dependencies(self.update_ops):
-                self.train_op = opt.apply_gradients(zip(grads, vs), global_step=self.global_step)
+            # Need to split the two networks so that clip_by_global_norm works properly
+            pi_grads, pi_vs = grads[:len(pi_params)], vs[:len(pi_params)]
+            vf_grads, vf_vs = grads[len(pi_params):], vs[len(pi_params):]
+            pi_grads, _ = tf.clip_by_global_norm(pi_grads, 10)
+            vf_grads, _ = tf.clip_by_global_norm(vf_grads, 10)
+            self.train_op = opt.apply_gradients(zip(pi_grads + vf_grads, pi_vs + vf_vs), global_step=self.global_step)
+
+            # for grad, var in zip(pi_grads + vf_grads, pi_vs + vf_vs):
+            #     tf.summary.histogram(var.name, grad)
 
         with tf.variable_scope('update_old_pi'):
             self.update_oldpi_op = [oldp.assign(p) for p, oldp in zip(pi_params, oldpi_params)]
@@ -112,10 +118,7 @@ class PPO(object):
         self.writer = tf.summary.FileWriter(SUMMARY_DIR, self.sess.graph)
         self.sess.run(tf.global_variables_initializer())
 
-        tf.summary.scalar("Loss/Actor", a_loss)
-        tf.summary.scalar("Loss/Critic", c_loss)
         tf.summary.scalar("Value", tf.reduce_mean(self.v))
-        tf.summary.scalar("Ratio", tf.reduce_mean(ratio))
         tf.summary.scalar("Sigma", tf.reduce_mean(pi.scale))
         self.summarise = tf.summary.merge(tf.get_collection(tf.GraphKeys.SUMMARIES))
 
@@ -137,7 +140,8 @@ class PPO(object):
             a_outputs, a_final_state = tf.nn.dynamic_rnn(cell=a_lstm, inputs=lstm_in, initial_state=a_init_state)
             a_cell_out = tf.reshape(a_outputs, [-1, LSTM_UNITS], name='flatten_lstm_outputs')
 
-            mu = tf.layers.dense(a_cell_out, self.a_dim, tf.nn.tanh, kernel_regularizer=w_reg, name="pi_mu")
+            mu = tf.layers.dense(a_cell_out, self.a_dim, tf.nn.tanh, kernel_regularizer=w_reg,
+                                 name="pi_mu", use_bias=False)
             sigma = tf.get_variable(name="pi_sigma", shape=self.a_dim, initializer=tf.ones_initializer())
             norm_dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.maximum(sigma, 0.1))
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)

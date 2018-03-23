@@ -25,146 +25,176 @@ OUTPUT_RESULTS_DIR = "./"
 ENVIRONMENT = 'BipedalWalker-v2'
 # ENVIRONMENT = 'BipedalWalkerHardcore-v2'
 
-EP_MAX = 100000
+EP_MAX = 10000
 GAMMA = 0.99
 LAMBDA = 0.95
 ENTROPY_BETA = 0.0
 LR = 0.0001
-BATCH = 4096
-MINI_BATCH = 128
+BATCH = 8192
+MINIBATCH = 64
 EPOCHS = 10
 EPSILON = 0.2
-L2_REG = 0.01
+VF_COEFF = 1.0
+L2_REG = 0.001
+PORT_OFFSET = 0  # number to offset the port from 2222. Useful for multiple runs
 
 
 class PPO(object):
-    def __init__(self, environment, is_chief=False):
+    def __init__(self, environment, wid):
         self.s_dim, self.a_dim = environment.observation_space.shape[0], environment.action_space.shape[0]
         self.a_bound = environment.action_space.high
+        self.wid = wid
+        is_chief = wid == 0
 
-        assert BATCH % MINI_BATCH == 0
-
-        self.state = tf.placeholder(tf.float32, [None, self.s_dim], 'state')  # TODO Normalise the state
+        self.state = tf.placeholder(tf.float32, [None, self.s_dim], 'state')
         self.actions = tf.placeholder(tf.float32, [None, self.a_dim], 'action')
         self.advantage = tf.placeholder(tf.float32, [None, 1], 'advantage')
         self.rewards = tf.placeholder(tf.float32, [None, 1], 'discounted_r')
 
-        self.global_step = tf.get_variable('global_step', [], initializer=tf.constant_initializer(0),
-                                           trainable=False, dtype=tf.int32)
+        self.dataset = tf.data.Dataset.from_tensor_slices({"state": self.state, "actions": self.actions,
+                                                           "rewards": self.rewards, "advantage": self.advantage})
+        self.dataset = self.dataset.shuffle(buffer_size=10000)
+        self.dataset = self.dataset.batch(MINIBATCH)
+        self.dataset = self.dataset.cache()
+        self.dataset = self.dataset.repeat(EPOCHS)
+        self.iterator = self.dataset.make_initializable_iterator()
+        batch = self.iterator.get_next()
 
-        pi, pi_params = self._build_anet('pi', trainable=True)
-        oldpi, oldpi_params = self._build_anet('oldpi', trainable=False)
+        # Create an old & new policy function but also
+        # make separate value & policy functions for evaluation & training (with shared variables)
+        oldpi, oldpi_params = self._build_anet(batch["state"], 'oldpi')
+        pi, pi_params = self._build_anet(batch["state"], 'pi')
+        evalpi, _ = self._build_anet(self.state, 'pi', reuse=True)
 
-        self.v, vf_params = self._build_cnet("vf", trainable=True)
-        oldvf, oldvf_params = self._build_cnet('oldvf', trainable=False)
+        self.v, vf_params = self._build_cnet(batch["state"], "vf")
+        self.evalvf, _ = self._build_cnet(self.state, 'vf', reuse=True)
 
-        self.sample_op = tf.squeeze(pi.sample(1), axis=0, name="sample_action")
-
-        with tf.variable_scope('update_old_functions'):
-            self.update_oldpi_op = [oldp.assign(p) for p, oldp in zip(pi_params, oldpi_params)]
-            self.update_oldvf_op = [oldp.assign(p) for p, oldp in zip(vf_params, oldvf_params)]
+        self.sample_op = tf.squeeze(evalpi.sample(1), axis=0, name="sample_action")
+        self.eval_action = evalpi.loc
 
         with tf.variable_scope('loss'):
-            with tf.variable_scope('actor_loss'):
-                self.ratio = tf.maximum(pi.prob(self.actions), 1e-9) / tf.maximum(oldpi.prob(self.actions), 1e-9)
-                self.ratio = tf.clip_by_value(self.ratio, 0, 2)
-                surr1 = self.ratio * self.advantage
-                surr2 = tf.clip_by_value(self.ratio, 1 - EPSILON, 1 + EPSILON) * self.advantage
-                self.aloss = -tf.reduce_mean(tf.minimum(surr1, surr2))
+            with tf.variable_scope('policy'):
+                # Use floor functions for the probabilities to prevent NaNs when prob = 0
+                ratio = pi.prob(batch["actions"]) / tf.maximum(oldpi.prob(batch["actions"]), 1e-6)
+                surr1 = batch["advantage"] * ratio
+                surr2 = batch["advantage"] * tf.clip_by_value(ratio, 1 - EPSILON, 1 + EPSILON)
+                loss_pi = -tf.reduce_mean(tf.minimum(surr1, surr2))
+                tf.summary.scalar("loss", loss_pi)
+                # tf.summary.histogram("Ratio", ratio)
 
-            with tf.variable_scope('critic_loss'):
-                self.closs = tf.reduce_mean(tf.square(self.v - self.rewards))
+            with tf.variable_scope('value_function'):
+                loss_vf = tf.reduce_mean(tf.square(self.v - batch["rewards"])) * 0.5
+                tf.summary.scalar("loss", loss_vf)
 
             with tf.variable_scope('entropy_bonus'):
                 entropy = pi.entropy()
-                self.pol_entpen = -ENTROPY_BETA * tf.reduce_mean(entropy)
+                pol_entpen = -ENTROPY_BETA * tf.reduce_mean(entropy)
 
-            self.loss = self.aloss + self.closs + self.pol_entpen
+            self.loss = loss_pi + loss_vf * VF_COEFF + pol_entpen
+            tf.summary.scalar("total", self.loss)
 
         with tf.variable_scope('train'):
+            self.global_step = tf.train.get_or_create_global_step()
             opt = tf.train.AdamOptimizer(LR)
             opt = tf.train.SyncReplicasOptimizer(opt, replicas_to_aggregate=N_AGG, total_num_replicas=N_WORKER)
 
-            grads, vs = zip(*opt.compute_gradients(self.loss))
-            grads, _ = tf.clip_by_global_norm(grads, 5.0)
-            self.train_op = opt.apply_gradients(zip(grads, vs), global_step=self.global_step)
+            grads, vs = zip(*opt.compute_gradients(self.loss, var_list=pi_params + vf_params))
+            # Need to split the two networks so that clip_by_global_norm works properly
+            pi_grads, pi_vs = grads[:len(pi_params)], vs[:len(pi_params)]
+            vf_grads, vf_vs = grads[len(pi_params):], vs[len(pi_params):]
+            # pi_grads, _ = tf.clip_by_global_norm(pi_grads, 10.0)
+            # vf_grads, _ = tf.clip_by_global_norm(vf_grads, 10.0)
+            self.train_op = opt.apply_gradients(zip(pi_grads + vf_grads, pi_vs + vf_vs), global_step=self.global_step)
 
             self.sync_replicas_hook = opt.make_session_run_hook(is_chief)
 
-        tf.summary.scalar("Loss/Actor", self.aloss)
-        tf.summary.scalar("Loss/Critic", self.closs)
+        with tf.variable_scope('update_old_pi'):
+            self.update_oldpi_op = [oldp.assign(p) for p, oldp in zip(pi_params, oldpi_params)]
+
         tf.summary.scalar("Value", tf.reduce_mean(self.v))
-        tf.summary.scalar("Ratio", tf.reduce_mean(self.ratio))
+        tf.summary.scalar("Sigma", tf.reduce_mean(pi.scale))
         self.summarise = tf.summary.merge(tf.get_collection(tf.GraphKeys.SUMMARIES))
 
-    def _build_anet(self, name, trainable):
+    def _build_anet(self, state_in, name, reuse=False):
         w_reg = tf.contrib.layers.l2_regularizer(L2_REG)
 
-        with tf.variable_scope(name):
-            l1 = tf.layers.dense(self.state, 400, tf.nn.relu, trainable=trainable,
-                                 kernel_regularizer=w_reg, name="pi_l1")
-            l2 = tf.layers.dense(l1, 400, tf.nn.relu, trainable=trainable, kernel_regularizer=w_reg, name="pi_l2")
-            mu = tf.layers.dense(l2, self.a_dim, tf.nn.tanh, trainable=trainable,
-                                 kernel_regularizer=w_reg, name="pi_mu_out")
-            log_sigma = tf.get_variable(name="pi_log_sigma_out", shape=self.a_dim, trainable=trainable,
-                                        initializer=tf.zeros_initializer(), regularizer=w_reg)
-            norm_dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.exp(log_sigma))
+        with tf.variable_scope(name, reuse=reuse):
+            l1 = tf.layers.dense(state_in, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l1")
+            l2 = tf.layers.dense(l1, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l2")
+            mu = tf.layers.dense(l2, self.a_dim, tf.nn.tanh, kernel_regularizer=w_reg, name="pi_mu")
+            sigma = tf.get_variable(name="pi_sigma", shape=self.a_dim, initializer=tf.ones_initializer())
+            norm_dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.maximum(sigma, 0.1))
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
         return norm_dist, params
 
-    def _build_cnet(self, name, trainable):
+    def _build_cnet(self, state_in, name, reuse=False):
         w_reg = tf.contrib.layers.l2_regularizer(L2_REG)
 
-        with tf.variable_scope(name):
-            l1 = tf.layers.dense(self.state, 400, tf.nn.relu, trainable=trainable,
-                                 kernel_regularizer=w_reg, name="vf_l1")
-            l2 = tf.layers.dense(l1, 400, tf.nn.relu, trainable=trainable, kernel_regularizer=w_reg, name="vf_l2")
-            vf = tf.layers.dense(l2, 1, trainable=trainable, kernel_regularizer=w_reg, name="vf_out")
+        with tf.variable_scope(name, reuse=reuse):
+            l1 = tf.layers.dense(state_in, 400, tf.nn.relu, kernel_regularizer=w_reg, name="vf_l1")
+            l2 = tf.layers.dense(l1, 400, tf.nn.relu, kernel_regularizer=w_reg, name="vf_l2")
+            vf = tf.layers.dense(l2, 1, kernel_regularizer=w_reg, name="vf_output")
+
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
         return vf, params
 
     def update(self, s, a, r, adv, sess):
-        sess.run([self.update_oldpi_op, self.update_oldvf_op])
+        start = time()
+        e_time = []
 
-        s_split = np.split(s, BATCH/MINI_BATCH)
-        a_split = np.split(a, BATCH/MINI_BATCH)
-        r_split = np.split(r, BATCH/MINI_BATCH)
-        adv_split = np.split(adv, BATCH/MINI_BATCH)
-        indexes = np.arange(BATCH/MINI_BATCH, dtype=int)
+        sess.run([self.update_oldpi_op, self.iterator.initializer],
+                 feed_dict={self.state: s, self.actions: a, self.rewards: r, self.advantage: adv})
 
-        for _ in range(EPOCHS):
-            # np.random.shuffle(indexes)  # uncomment this to shuffle the batches
-            for i in indexes:
-                sess.run(self.train_op, {self.state: s_split[i], self.actions: a_split[i],
-                                         self.advantage: adv_split[i], self.rewards: r_split[i]})
+        while True:
+            try:
+                e_start = time()
+                summary, step, _ = sess.run([self.summarise, self.global_step, self.train_op])
+                e_time.append(time() - e_start)
+            except tf.errors.OutOfRangeError:
+                break
+        print("Worker_%i Trained in %.3fs at %.3fs/batch. Global step %i" % (self.wid, time() - start, np.mean(e_time), step))
+        return summary
 
-    def eval_state(self, state, sess):
-        action, value = sess.run([self.sample_op, self.v], {self.state: state[np.newaxis, :]})
+    def eval_state(self, state, sess, stochastic=True):
+        if stochastic:
+            action, value = sess.run([self.sample_op, self.evalvf], {self.state: state[np.newaxis, :]})
+        else:
+            action, value = sess.run([self.eval_action, self.evalvf], {self.state: state[np.newaxis, :]})
         return action[0], value[0]
 
 
-def start_parameter_server(pid):
-    cluster = tf.train.ClusterSpec({"ps": ["localhost:" + str(2222 + i) for i in range(PS)],
-                                    "worker": ["localhost:" + str(2222 + PS + i) for i in range(N_WORKER)]})
+def start_parameter_server(pid, spec):
+    cluster = tf.train.ClusterSpec(spec)
     server = tf.train.Server(cluster, job_name="ps", task_index=pid)
     print("Starting PS #{}".format(pid))
     server.join()
 
 
+# class StopAtEpisodeHook(tf.train.SessionRunHook):
+#     def __init__(self, max_episodes, worker):
+#         self.ep_max = max_episodes
+#         self.wid = worker
+#
+#     def after_run(self, run_context, run_values):
+#         global episode
+#         if episode >= self.ep_max and self.wid == 0:
+#             print("Reached %i episodes" % episode)
+#             run_context.request_stop()
+
+
 class Worker(object):
-    def __init__(self, wid):
+    def __init__(self, wid, spec):
         self.wid = wid
         self.env = gym.make(ENVIRONMENT)
 
         print("Starting Worker #{}".format(wid))
-        cluster = tf.train.ClusterSpec({#"ps": ["localhost:" + str(2222 + i) for i in range(PS)],
-                                        "worker": ["localhost:" + str(2222 + PS + i) for i in range(N_WORKER)]})
+        cluster = tf.train.ClusterSpec(spec)
         self.server = tf.train.Server(cluster, job_name="worker", task_index=wid)
 
         with tf.device(tf.train.replica_device_setter(worker_device="/job:worker/task:%d" % wid, cluster=cluster)):
             if self.wid == 0:
                 self.env = wrappers.Monitor(self.env, os.path.join(SUMMARY_DIR, ENVIRONMENT), video_callable=None)
-            self.ppo = PPO(self.env, self.wid == 0)
+            self.ppo = PPO(self.env, self.wid)
 
     @staticmethod
     def add_histogram(writer, tag, values, step, bins=1000):
@@ -204,13 +234,12 @@ class Worker(object):
         return scipy.signal.lfilter([1], [1, -gamma], x[::-1], axis=0)[::-1]
 
     def work(self):
-        hooks = [self.ppo.sync_replicas_hook]  # TODO: Create a hook that uses episodes? Need a global_episode variable
-
+        hooks = [self.ppo.sync_replicas_hook]
         sess = tf.train.MonitoredTrainingSession(master=self.server.target, is_chief=(self.wid == 0),
                                                  checkpoint_dir=SUMMARY_DIR,
                                                  save_summaries_steps=None, save_summaries_secs=None, hooks=hooks)
         if self.wid == 0:
-            writer = tf.summary.FileWriter(SUMMARY_DIR, sess.graph)
+            writer = SummaryWriterCache.get(SUMMARY_DIR)
 
         t, episode = 0, 0
         buffer_s, buffer_a, buffer_r, buffer_v, terminals = [], [], [], [], []
@@ -223,7 +252,11 @@ class Worker(object):
             while True:
                 a, v = self.ppo.eval_state(s, sess)
 
-                if ep_t > 0 and (t % BATCH == 0 or terminal):
+                if ep_t > 0 and terminal:
+                    # End of episode summary
+                    print('{0:.1f}%'.format(episode / EP_MAX * 100), '| Worker_%i' % self.wid,
+                          '| Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
+
                     v = [v[0] * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
                     rewards = np.array(buffer_r)
                     vpred = np.array(buffer_v + v)
@@ -237,36 +270,30 @@ class Worker(object):
                     bs, ba, br, badv = np.vstack(buffer_s), np.vstack(buffer_a), np.vstack(tdlamret), np.vstack(advantage)
 
                     # Update PPO
-                    if t % BATCH == 0:
-                        print("Worker_%i Training..." % self.wid)
-                        self.ppo.update(bs, ba, br, badv, sess)
+                    if t >= BATCH:
+                        print("Worker_%i Training using %i steps..." % (self.wid, t))
+                        graph_summary = self.ppo.update(bs, ba, br, badv, sess)
                         buffer_s, buffer_a, buffer_r, buffer_v, terminals = [], [], [], [], []
+                        t = 0
 
-                    # End of episode summary
-                    if terminal and ep_t > 0:
+                    if self.wid == 0:
+                        worker_summary = tf.Summary()
+                        worker_summary.value.add(tag="Reward", simple_value=ep_r)
 
-                        print('{0:.1f}%'.format(episode / EP_MAX * 100), '| Worker_%i' % self.wid,
-                              '| Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
+                        # Create Action histograms for each dimension
+                        actions = np.array(ep_a)
+                        for a in range(self.ppo.a_dim):
+                            self.add_histogram(writer, "Action/Dim" + str(a), actions[:, a], episode)
 
-                        if self.wid == 0:
-                            worker_summary = tf.Summary()
-                            worker_summary.value.add(tag="Reward", simple_value=ep_r)
-
-                            # Create Action histograms for each dimension
-                            actions = np.array(ep_a)
-                            for a in range(self.ppo.a_dim):
-                                self.add_histogram(writer, "Action/Dim" + str(a), actions[:, a], episode)
-
-                            graph_summary = sess.run(self.ppo.summarise, feed_dict={self.ppo.state: bs,
-                                                                                    self.ppo.actions: ba,
-                                                                                    self.ppo.advantage: badv,
-                                                                                    self.ppo.rewards: br})
+                        try:
                             writer.add_summary(graph_summary, episode)
-                            writer.add_summary(worker_summary, episode)
-                            writer.flush()
+                        except NameError:
+                            pass
+                        writer.add_summary(worker_summary, episode)
+                        writer.flush()
 
-                        episode += 1
-                        break
+                    episode += 1
+                    break
 
                 buffer_s.append(s)
                 buffer_a.append(a)
@@ -282,15 +309,22 @@ class Worker(object):
                 t += 1
 
         self.env.close()
+        print("Worker_%i finished" % self.wid)
+
+
+def main(_):
+    pass
 
 
 if __name__ == '__main__':
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    tf.logging.set_verbosity(tf.logging.ERROR)
     parser = argparse.ArgumentParser()
     parser.add_argument('--job_name', action='store', dest='job_name', help='Either "ps" or "worker"')
     parser.add_argument('--task_index', action='store', dest='task_index', help='ID number of the job')
     parser.add_argument('--timestamp', action='store', dest='timestamp', help='Timestamp for output directory')
     parser.add_argument('--workers', action='store', dest='n_workers', help='Number of workers')
-    parser.add_argument('--agg', action='store', dest='n_agg', help='Number of gradients to aggegate')
+    parser.add_argument('--agg', action='store', dest='n_agg', help='Number of gradients to aggregate')
     parser.add_argument('--ps', action='store', dest='ps', help='Number of parameter servers')
     args = parser.parse_args()
 
@@ -300,8 +334,14 @@ if __name__ == '__main__':
     TIMESTAMP = args.timestamp
     SUMMARY_DIR = os.path.join(OUTPUT_RESULTS_DIR, "DPPO", ENVIRONMENT, TIMESTAMP)
 
+    if PS == 0:
+        spec = {"worker": ["localhost:" + str(2222 + PS + i + PORT_OFFSET) for i in range(N_WORKER)]}
+    else:
+        spec = {"ps": ["localhost:" + str(2222 + i + PORT_OFFSET) for i in range(PS)],
+                "worker": ["localhost:" + str(2222 + PS + i + PORT_OFFSET) for i in range(N_WORKER)]}
+
     if args.job_name == "ps":
-        tf.app.run(start_parameter_server(int(args.task_index)))
+        tf.app.run(start_parameter_server(int(args.task_index), spec))
     elif args.job_name == "worker":
-        w = Worker(int(args.task_index))
+        w = Worker(int(args.task_index), spec)
         tf.app.run(w.work())
