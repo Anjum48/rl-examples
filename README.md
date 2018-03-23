@@ -44,3 +44,7 @@ DPPO was tested on a 16 core machine using CPU only, so the helper
 script will need to be updated for your particular setup.
 For my setup, there was usually no speed advantage training on the 
 CPU vs GPU (GTX 1080), but your performance may differ
+
+## Issues/Todo's
+- I wrote DDPG a while back. Need to update to use the more modern TensorFlow API features
+- The LSTM batching in A3C is incorrect. Need to fix this (see PPO_LSTM for the correct implementation)
