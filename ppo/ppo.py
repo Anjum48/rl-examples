@@ -276,7 +276,7 @@ while True:
     ep_r, ep_t = 0, 0
     while True:
         env.render()
-        a, v = ppo.eval_state(s)
+        a, v = ppo.eval_state(s, stochastic=False)
         s, r, terminal, _ = env.step(np.clip(a, -ppo.a_bound, ppo.a_bound))
         ep_r += r
         ep_t += 1
