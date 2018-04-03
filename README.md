@@ -25,8 +25,10 @@ Big thanks also to the TensorFlow community.
 
 - GAE was used in all algorithms except for DPPG
 - Where possible, I've added an LSTM layer to the policy and value functions.
-This usually made the more complex environments more stable (but slower)
+This sometimes achieved higher scores in some environments, but can have stability issues
 - Distributed Proximal Policy Optimisation (DPPO) is currently a bit unstable, but does work at low learning rates
+- In some environments, having a joint network for the actor & critic performs better (i.e. where CNNs are used).
+These scripts are suffixed, e.g. `ppo.joined.py`
 
 ## Training
 All the Python scripts are written as standalone scripts. Just run them
