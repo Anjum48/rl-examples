@@ -26,9 +26,8 @@ Big thanks also to the TensorFlow community.
 - GAE was used in all algorithms except for DPPG
 - Where possible, I've added an LSTM layer to the policy and value functions.
 This sometimes achieved higher scores in some environments, but can have stability issues
-- Distributed Proximal Policy Optimisation (DPPO) is currently a bit unstable, but does work at low learning rates
 - In some environments, having a joint network for the actor & critic performs better (i.e. where CNNs are used).
-These scripts are suffixed, e.g. `ppo.joined.py`
+These scripts are suffixed, e.g. `ppo_joined.py`
 
 ## Training
 All the Python scripts are written as standalone scripts. Just run them
@@ -49,3 +48,5 @@ CPU vs GPU (GTX 1080), but CarRacing did get a performance boost due to the usag
 
 ## Issues/Todo's
 - The LSTM batching in A3C is incorrect. Need to fix this (see PPO_LSTM for the correct implementation)
+- Distributed Proximal Policy Optimisation with the LSTM (`dppo_lstm.py`) is sometimes a bit unstable,
+but does work at low learning rates
