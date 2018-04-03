@@ -26,7 +26,7 @@ Big thanks also to the TensorFlow community.
 - GAE was used in all algorithms except for DPPG
 - Where possible, I've added an LSTM layer to the policy and value functions.
 This usually made the more complex environments more stable (but slower)
-- DPPO is currently a bit unstable, but does work
+- Distributed Proximal Policy Optimisation (DPPO) is currently a bit unstable, but does work at low learning rates
 
 ## Training
 All the Python scripts are written as standalone scripts. Just run them
@@ -36,15 +36,14 @@ DPPO has a helper script to set off the worker threads
 
 ## Requirements
 - Python 3.5+
-- OpenAI Gym
-- TensorFlow 1.5
+- OpenAI Gym 0.10.3+
+- TensorFlow 1.6
 - Numpy 1.13+
 
 DPPO was tested on a 16 core machine using CPU only, so the helper
 script will need to be updated for your particular setup.
-For my setup, there was usually no speed advantage training on the 
-CPU vs GPU (GTX 1080), but your performance may differ
+For my setup, there was usually no speed advantage training BipedalWalker on the
+CPU vs GPU (GTX 1080), but CarRacing did get a performance boost due to the usage of CNNs
 
 ## Issues/Todo's
-- I wrote DDPG a while back. Need to update to use the more modern TensorFlow API features
 - The LSTM batching in A3C is incorrect. Need to fix this (see PPO_LSTM for the correct implementation)

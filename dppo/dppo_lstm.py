@@ -16,7 +16,9 @@ import numpy as np
 import gym
 import os
 import scipy.signal
+from time import time
 from gym import wrappers
+from tensorflow.python.training.summary_io import SummaryWriterCache
 OUTPUT_RESULTS_DIR = "./"
 
 # ENVIRONMENT = 'Pendulum-v0'
@@ -24,17 +26,18 @@ OUTPUT_RESULTS_DIR = "./"
 # ENVIRONMENT = 'LunarLanderContinuous-v2'
 ENVIRONMENT = 'BipedalWalker-v2'
 # ENVIRONMENT = 'BipedalWalkerHardcore-v2'
+# ENVIRONMENT = 'CarRacing-v0'
 
 EP_MAX = 10000
 GAMMA = 0.99
 LAMBDA = 0.95
 ENTROPY_BETA = 0.0
-LR = 0.0001
+LR = 0.00005
 BATCH = 8192
 MINIBATCH = 64
 EPOCHS = 10
-EPSILON = 0.2
-VF_COEFF = 0.5
+EPSILON = 0.1
+VF_COEFF = 1.0
 L2_REG = 0.001
 LSTM_UNITS = 128
 LSTM_LAYERS = 1
@@ -44,12 +47,13 @@ PORT_OFFSET = 0  # number to offset the port from 2222. Useful for multiple runs
 
 class PPO(object):
     def __init__(self, environment, wid):
-        self.s_dim, self.a_dim = environment.observation_space.shape[0], environment.action_space.shape[0]
+        self.s_dim, self.a_dim = environment.observation_space.shape, environment.action_space.shape[0]
         self.a_bound = environment.action_space.high
+        self.cnn = len(self.s_dim) == 3
         self.wid = wid
         is_chief = wid == 0
 
-        self.state = tf.placeholder(tf.float32, [None, self.s_dim], 'state')
+        self.state = tf.placeholder(tf.float32, [None] + list(self.s_dim), 'state')
         self.actions = tf.placeholder(tf.float32, [None, self.a_dim], 'action')
         self.advantage = tf.placeholder(tf.float32, [None, 1], 'advantage')
         self.rewards = tf.placeholder(tf.float32, [None, 1], 'discounted_r')
@@ -65,54 +69,66 @@ class PPO(object):
 
         # Create an old & new policy function but also
         # make separate value & policy functions for evaluation & training (with shared variables)
-        oldpi, oldpi_params, _, _ = self._build_anet(batch["state"], 'oldpi')
+        pi_old, pi_old_params, _, _ = self._build_anet(batch["state"], 'oldpi')
         pi, pi_params, self.pi_i_state, self.pi_f_state = self._build_anet(batch["state"], 'pi')
-        evalpi, _, self.evalpi_i_state, self.evalpi_f_state = self._build_anet(self.state, 'pi', reuse=True, batch_size=1)
+        pi_eval, _, self.pi_eval_i_state, self.pi_eval_f_state = self._build_anet(self.state, 'pi', reuse=True, batch_size=1)
 
+        vf_old, vf_old_params, _, _ = self._build_cnet(batch["state"], "oldvf")
         self.v, vf_params, self.vf_i_state, self.vf_f_state = self._build_cnet(batch["state"], "vf")
-        self.evalvf, _, self.evalvf_i_state, self.evalvf_f_state = self._build_cnet(self.state, 'vf', reuse=True, batch_size=1)
+        self.vf_eval, _, self.vf_eval_i_state, self.vf_eval_f_state = self._build_cnet(self.state, 'vf', reuse=True, batch_size=1)
 
-        self.sample_op = tf.squeeze(evalpi.sample(1), axis=0, name="sample_action")
-        self.eval_action = evalpi.loc
+        self.sample_op = tf.squeeze(pi_eval.sample(1), axis=0, name="sample_action")
+        self.eval_action = pi_eval.loc
 
         with tf.variable_scope('loss'):
+            epsilon_decay = tf.train.polynomial_decay(EPSILON, self.global_step, 1e6, 0.1, power=0.0)
+
             with tf.variable_scope('policy'):
                 # Use floor functions for the probabilities to prevent NaNs when prob = 0
-                ratio = pi.prob(batch["actions"]) / tf.maximum(oldpi.prob(batch["actions"]), 1e-6)
+                ratio = tf.maximum(pi.prob(batch["actions"]), 1e-6) / tf.maximum(pi_old.prob(batch["actions"]), 1e-6)
+                ratio = tf.clip_by_value(ratio, 0, 10)
                 surr1 = batch["advantage"] * ratio
-                surr2 = batch["advantage"] * tf.clip_by_value(ratio, 1 - EPSILON, 1 + EPSILON)
+                surr2 = batch["advantage"] * tf.clip_by_value(ratio, 1 - epsilon_decay, 1 + epsilon_decay)
                 loss_pi = -tf.reduce_mean(tf.minimum(surr1, surr2))
                 tf.summary.scalar("loss", loss_pi)
-                # tf.summary.histogram("Ratio", ratio)
+                tf.summary.scalar("max_ratio", tf.reduce_max(ratio))
 
             with tf.variable_scope('value_function'):
-                loss_vf = tf.reduce_mean(tf.square(self.v - batch["rewards"])) * 0.5
+                clipped_value_estimate = vf_old + tf.clip_by_value(self.v - vf_old, -epsilon_decay, epsilon_decay)
+                loss_vf1 = tf.squared_difference(clipped_value_estimate, batch["rewards"])
+                loss_vf2 = tf.squared_difference(self.v, batch["rewards"])
+                loss_vf = tf.reduce_mean(tf.maximum(loss_vf1, loss_vf2)) * 0.5
+                # loss_vf = tf.reduce_mean(tf.square(self.v - batch["rewards"])) * 0.5
                 tf.summary.scalar("loss", loss_vf)
 
             with tf.variable_scope('entropy_bonus'):
                 entropy = pi.entropy()
                 pol_entpen = -ENTROPY_BETA * tf.reduce_mean(entropy)
 
-            self.loss = loss_pi + loss_vf * VF_COEFF + pol_entpen
-            tf.summary.scalar("total", self.loss)
+            loss = loss_pi + loss_vf * VF_COEFF + pol_entpen
+            tf.summary.scalar("total", loss)
+            tf.summary.scalar("epsilon", epsilon_decay)
 
         with tf.variable_scope('train'):
             self.global_step = tf.train.get_or_create_global_step()
             opt = tf.train.AdamOptimizer(LR)
             opt = tf.train.SyncReplicasOptimizer(opt, replicas_to_aggregate=N_AGG, total_num_replicas=N_WORKER)
 
-            grads, vs = zip(*opt.compute_gradients(self.loss, var_list=pi_params + vf_params))
+            self.train_op = opt.minimize(loss, global_step=self.global_step, var_list=pi_params + vf_params)
+
+            # grads, vs = zip(*opt.compute_gradients(loss, var_list=pi_params + vf_params))
             # Need to split the two networks so that clip_by_global_norm works properly
-            pi_grads, pi_vs = grads[:len(pi_params)], vs[:len(pi_params)]
-            vf_grads, vf_vs = grads[len(pi_params):], vs[len(pi_params):]
-            pi_grads, _ = tf.clip_by_global_norm(pi_grads, 10.0)
-            vf_grads, _ = tf.clip_by_global_norm(vf_grads, 10.0)
-            self.train_op = opt.apply_gradients(zip(pi_grads + vf_grads, pi_vs + vf_vs), global_step=self.global_step)
+            # pi_grads, pi_vs = grads[:len(pi_params)], vs[:len(pi_params)]
+            # vf_grads, vf_vs = grads[len(pi_params):], vs[len(pi_params):]
+            # pi_grads, _ = tf.clip_by_global_norm(pi_grads, 10.0)
+            # vf_grads, _ = tf.clip_by_global_norm(vf_grads, 10.0)
+            # self.train_op = opt.apply_gradients(zip(pi_grads + vf_grads, pi_vs + vf_vs), global_step=self.global_step)
 
             self.sync_replicas_hook = opt.make_session_run_hook(is_chief)
 
-        with tf.variable_scope('update_old_pi'):
-            self.update_oldpi_op = [oldp.assign(p) for p, oldp in zip(pi_params, oldpi_params)]
+        with tf.variable_scope('update_old'):
+            self.update_pi_old_op = [oldp.assign(p) for p, oldp in zip(pi_params, pi_old_params)]
+            self.update_vf_old_op = [oldp.assign(p) for p, oldp in zip(vf_params, vf_old_params)]
 
         tf.summary.scalar("Value", tf.reduce_mean(self.v))
         tf.summary.scalar("Sigma", tf.reduce_mean(pi.scale))
@@ -122,6 +138,13 @@ class PPO(object):
         w_reg = tf.contrib.layers.l2_regularizer(L2_REG)
 
         with tf.variable_scope(name, reuse=reuse):
+            if self.cnn:
+                scaled = tf.cast(state_in, tf.float32) / 255.
+                conv1 = tf.layers.conv2d(inputs=scaled, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
+                conv2 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=4, strides=2, activation=tf.nn.relu)
+                conv3 = tf.layers.conv2d(inputs=conv2, filters=64, kernel_size=3, strides=1, activation=tf.nn.relu)
+                state_in = tf.layers.flatten(conv3)
+
             l1 = tf.layers.dense(state_in, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l1")
             l2 = tf.layers.dense(l1, LSTM_UNITS, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l2")
 
@@ -138,8 +161,8 @@ class PPO(object):
 
             mu = tf.layers.dense(a_cell_out, self.a_dim, tf.nn.tanh, kernel_regularizer=w_reg,
                                  name="pi_mu", use_bias=False)
-            sigma = tf.get_variable(name="pi_sigma", shape=self.a_dim, initializer=tf.ones_initializer())
-            norm_dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.maximum(sigma, 0.1))
+            log_sigma = tf.get_variable(name="pi_sigma", shape=self.a_dim, initializer=tf.zeros_initializer())
+            norm_dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.maximum(tf.exp(log_sigma), 0.1))
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
         return norm_dist, params, a_init_state, a_final_state
 
@@ -147,6 +170,13 @@ class PPO(object):
         w_reg = tf.contrib.layers.l2_regularizer(L2_REG)
 
         with tf.variable_scope(name, reuse=reuse):
+            if self.cnn:
+                scaled = tf.cast(state_in, tf.float32) / 255.
+                conv1 = tf.layers.conv2d(inputs=scaled, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
+                conv2 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=4, strides=2, activation=tf.nn.relu)
+                conv3 = tf.layers.conv2d(inputs=conv2, filters=64, kernel_size=3, strides=1, activation=tf.nn.relu)
+                state_in = tf.layers.flatten(conv3)
+
             l1 = tf.layers.dense(state_in, 400, tf.nn.relu, kernel_regularizer=w_reg, name="vf_l1")
             l2 = tf.layers.dense(l1, LSTM_UNITS, tf.nn.relu, kernel_regularizer=w_reg, name="vf_l2")
 
@@ -167,9 +197,10 @@ class PPO(object):
 
     def update(self, exp, sess):
         start, e_time = time(), []
-        sess.run([self.update_oldpi_op])
+        sess.run([self.update_pi_old_op, self.update_vf_old_op])
 
         for k in range(EPOCHS):
+            np.random.shuffle(exp)
             for ep_s, ep_a, ep_r, ep_adv in exp:
 
                 # Trim down to round minibatches
@@ -198,13 +229,13 @@ class PPO(object):
 
     def eval_state(self, state, a_state, c_state, sess, stochastic=True):
         if stochastic:
-            eval_ops = [self.sample_op, self.evalvf, self.evalpi_f_state, self.evalvf_f_state]
+            eval_ops = [self.sample_op, self.vf_eval, self.pi_eval_f_state, self.vf_eval_f_state]
         else:
-            eval_ops = [self.eval_action, self.evalvf, self.evalpi_f_state, self.evalvf_f_state]
+            eval_ops = [self.eval_action, self.vf_eval, self.pi_eval_f_state, self.vf_eval_f_state]
 
         a, v, a_state, c_state = sess.run(eval_ops,
-                                          {self.state: state[np.newaxis, :], self.evalpi_i_state: a_state,
-                                           self.evalvf_i_state: c_state, self.keep_prob: 1.0})
+                                          {self.state: state[np.newaxis, :], self.pi_eval_i_state: a_state,
+                                           self.vf_eval_i_state: c_state, self.keep_prob: 1.0})
         return a[0], v[0], a_state, c_state
 
 
@@ -279,15 +310,15 @@ class Worker(object):
         experience = []
 
         while not sess.should_stop() and not (episode > EP_MAX and self.wid == 0):
-            a_lstm_state, c_lstm_state = sess.run([self.ppo.evalpi_i_state, self.ppo.evalvf_i_state])
+            a_lstm_state, c_lstm_state = sess.run([self.ppo.pi_eval_i_state, self.ppo.vf_eval_i_state])
             s = self.env.reset()
-            ep_r, ep_t, terminal = 0, 0, True
+            ep_r, ep_t, terminal = 0, 0, False
             ep_a = []
 
             while True:
                 a, v, a_lstm_state, c_lstm_state = self.ppo.eval_state(s, a_lstm_state, c_lstm_state, sess)
 
-                if ep_t > 0 and terminal:
+                if terminal:
                     # End of episode summary
                     print('{0:.1f}%'.format(episode / EP_MAX * 100), '| Worker_%i' % self.wid,
                           '| Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
@@ -298,13 +329,15 @@ class Worker(object):
                     terminals_array = np.array(terminals + [0])
 
                     # Generalized Advantage Estimation - https://arxiv.org/abs/1506.02438
-                    advantage = self.discount(rewards + GAMMA * vpred[1:] * (1 - terminals_array[1:]) - vpred[:-1], GAMMA * LAMBDA)
-                    tdlamret = advantage + np.array(buffer_v)
-                    advantage = (advantage - advantage.mean()) / np.maximum(advantage.std(), 1e-6)
+                    delta = rewards + GAMMA * vpred[1:] * (1 - terminals_array[1:]) - vpred[:-1]
+                    advantage = self.discount(delta, GAMMA * LAMBDA)
+                    td_lambda_returns = advantage + np.array(buffer_v)
+                    advantage = (advantage - np.mean(advantage)) / np.maximum(np.std(advantage), 1e-6)
 
                     if len(rewards) >= MINIBATCH:  # Ignore episodes shorter than a minibatch
-                        bs, ba, br, badv = np.vstack(buffer_s), np.vstack(buffer_a), np.vstack(tdlamret), np.vstack(advantage)
-                        experience.append((bs, ba, br, badv))
+                        bs, ba, br, badv = np.reshape(buffer_s, (ep_t,) + self.ppo.s_dim), np.vstack(buffer_a), \
+                                           np.vstack(td_lambda_returns), np.vstack(advantage)
+                        experience.append([bs, ba, br, badv])
                     else:
                         t -= len(rewards)
 
@@ -312,6 +345,11 @@ class Worker(object):
 
                     # Update PPO
                     if t >= BATCH:
+                        # Per batch normalisation of advantages
+                        # advs = np.concatenate(list(zip(*experience))[3])
+                        # for x in experience:
+                        #     x[3] = (x[3] - np.mean(advs)) / np.maximum(np.std(advs), 1e-6)
+
                         print("Worker_%i Training using %i episodes and %i steps..." % (self.wid, len(experience), t))
 
                         graph_summary = self.ppo.update(experience, sess)
@@ -375,6 +413,7 @@ if __name__ == '__main__':
     TIMESTAMP = args.timestamp
     SUMMARY_DIR = os.path.join(OUTPUT_RESULTS_DIR, "DPPO_LSTM", ENVIRONMENT, TIMESTAMP)
 
+    # This could be defined in a parameter file
     if PS == 0:
         spec = {"worker": ["localhost:" + str(2222 + PS + i + PORT_OFFSET) for i in range(N_WORKER)]}
     else:

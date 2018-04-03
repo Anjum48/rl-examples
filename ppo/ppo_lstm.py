@@ -22,19 +22,20 @@ OUTPUT_RESULTS_DIR = "./"
 # ENVIRONMENT = 'Pendulum-v0'
 # ENVIRONMENT = 'MountainCarContinuous-v0'
 # ENVIRONMENT = 'LunarLanderContinuous-v2'
-ENVIRONMENT = 'BipedalWalker-v2'
+# ENVIRONMENT = 'BipedalWalker-v2'
 # ENVIRONMENT = 'BipedalWalkerHardcore-v2'
+ENVIRONMENT = 'CarRacing-v0'
 
 EP_MAX = 10000
 GAMMA = 0.99
 LAMBDA = 0.95
 ENTROPY_BETA = 0.0
-LR = 0.0001
+LR = 0.00005
 BATCH = 8192
 MINIBATCH = 64
 EPOCHS = 10
-EPSILON = 0.2
-VF_COEFF = 0.5
+EPSILON = 0.1
+VF_COEFF = 1.0
 L2_REG = 0.001
 LSTM_UNITS = 128
 LSTM_LAYERS = 1
@@ -46,13 +47,15 @@ SUMMARY_DIR = os.path.join(OUTPUT_RESULTS_DIR, "PPO_LSTM", ENVIRONMENT, TIMESTAM
 
 class PPO(object):
     def __init__(self, environment):
-        self.s_dim, self.a_dim = environment.observation_space.shape[0], environment.action_space.shape[0]
+        self.s_dim, self.a_dim = environment.observation_space.shape, environment.action_space.shape[0]
         self.a_bound = environment.action_space.high
+        self.cnn = len(self.s_dim) == 3
 
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-        config = tf.ConfigProto(log_device_placement=False, device_count={'GPU': 0})  # 1 for GPU, 0 for CPU
+        config = tf.ConfigProto(log_device_placement=False, device_count={'GPU': 1})  # 1 for GPU, 0 for CPU
+        config.gpu_options.per_process_gpu_memory_fraction = 0.1
         self.sess = tf.Session(config=config)
-        self.state = tf.placeholder(tf.float32, [None, self.s_dim], 'state')
+        self.state = tf.placeholder(tf.float32, [None] + list(self.s_dim), 'state')
         self.actions = tf.placeholder(tf.float32, [None, self.a_dim], 'action')
         self.advantage = tf.placeholder(tf.float32, [None, 1], 'advantage')
         self.rewards = tf.placeholder(tf.float32, [None, 1], 'discounted_r')
@@ -68,52 +71,63 @@ class PPO(object):
 
         # Create an old & new policy function but also
         # make separate value & policy functions for evaluation & training (with shared variables)
-        oldpi, oldpi_params, _, _ = self._build_anet(batch["state"], 'oldpi')
+        pi_old, pi_old_params, _, _ = self._build_anet(batch["state"], 'oldpi')
         pi, pi_params, self.pi_i_state, self.pi_f_state = self._build_anet(batch["state"], 'pi')
-        evalpi, _, self.evalpi_i_state, self.evalpi_f_state = self._build_anet(self.state, 'pi', reuse=True, batch_size=1)
+        pi_eval, _, self.pi_eval_i_state, self.evalpi_f_state = self._build_anet(self.state, 'pi', reuse=True, batch_size=1)
 
+        vf_old, vf_old_params, _, _ = self._build_cnet(batch["state"], "oldvf")
         self.v, vf_params, self.vf_i_state, self.vf_f_state = self._build_cnet(batch["state"], "vf")
-        self.evalvf, _, self.evalvf_i_state, self.evalvf_f_state = self._build_cnet(self.state, 'vf', reuse=True, batch_size=1)
+        self.vf_eval, _, self.vf_eval_i_state, self.vf_eval_f_state = self._build_cnet(self.state, 'vf', reuse=True, batch_size=1)
 
-        self.sample_op = tf.squeeze(evalpi.sample(1), axis=0, name="sample_action")
-        self.eval_action = evalpi.loc
+        self.sample_op = tf.squeeze(pi_eval.sample(1), axis=0, name="sample_action")
+        self.eval_action = pi_eval.loc
 
         with tf.variable_scope('loss'):
+            epsilon_decay = tf.train.polynomial_decay(EPSILON, self.global_step, 1e5, 0.01, power=0.0)
+
             with tf.variable_scope('policy'):
                 # Use floor functions for the probabilities to prevent NaNs when prob = 0
-                ratio = pi.prob(batch["actions"]) / tf.maximum(oldpi.prob(batch["actions"]), 1e-6)
+                ratio = tf.maximum(pi.prob(batch["actions"]), 1e-6) / tf.maximum(pi_old.prob(batch["actions"]), 1e-6)
+                ratio = tf.clip_by_value(ratio, 0, 10)
                 surr1 = batch["advantage"] * ratio
-                surr2 = batch["advantage"] * tf.clip_by_value(ratio, 1 - EPSILON, 1 + EPSILON)
+                surr2 = batch["advantage"] * tf.clip_by_value(ratio, 1 - epsilon_decay, 1 + epsilon_decay)
                 loss_pi = -tf.reduce_mean(tf.minimum(surr1, surr2))
                 tf.summary.scalar("loss", loss_pi)
-                # tf.summary.histogram("Ratio", ratio)
 
             with tf.variable_scope('value_function'):
-                loss_vf = tf.reduce_mean(tf.square(self.v - batch["rewards"])) * 0.5
+                clipped_value_estimate = vf_old + tf.clip_by_value(self.v - vf_old, -epsilon_decay, epsilon_decay)
+                loss_vf1 = tf.squared_difference(clipped_value_estimate, batch["rewards"])
+                loss_vf2 = tf.squared_difference(self.v, batch["rewards"])
+                loss_vf = tf.reduce_mean(tf.maximum(loss_vf1, loss_vf2)) * 0.5
+                # loss_vf = tf.reduce_mean(tf.square(self.v - batch["rewards"])) * 0.5
                 tf.summary.scalar("loss", loss_vf)
 
             with tf.variable_scope('entropy_bonus'):
                 entropy = pi.entropy()
                 pol_entpen = -ENTROPY_BETA * tf.reduce_mean(entropy)
 
-            self.loss = loss_pi + loss_vf * VF_COEFF + pol_entpen
-            tf.summary.scalar("total", self.loss)
+            loss = loss_pi + loss_vf * VF_COEFF + pol_entpen
+            tf.summary.scalar("total", loss)
+            tf.summary.scalar("epsilon", epsilon_decay)
 
         with tf.variable_scope('train'):
             opt = tf.train.AdamOptimizer(LR)
-            grads, vs = zip(*opt.compute_gradients(self.loss, var_list=pi_params + vf_params))
+            self.train_op = opt.minimize(loss, global_step=self.global_step, var_list=pi_params + vf_params)
+
+            # grads, vs = zip(*opt.compute_gradients(loss, var_list=pi_params + vf_params))
             # Need to split the two networks so that clip_by_global_norm works properly
-            pi_grads, pi_vs = grads[:len(pi_params)], vs[:len(pi_params)]
-            vf_grads, vf_vs = grads[len(pi_params):], vs[len(pi_params):]
-            pi_grads, _ = tf.clip_by_global_norm(pi_grads, 10)
-            vf_grads, _ = tf.clip_by_global_norm(vf_grads, 10)
-            self.train_op = opt.apply_gradients(zip(pi_grads + vf_grads, pi_vs + vf_vs), global_step=self.global_step)
+            # pi_grads, pi_vs = grads[:len(pi_params)], vs[:len(pi_params)]
+            # vf_grads, vf_vs = grads[len(pi_params):], vs[len(pi_params):]
+            # pi_grads, _ = tf.clip_by_global_norm(pi_grads, 10)
+            # vf_grads, _ = tf.clip_by_global_norm(vf_grads, 10)
+            # self.train_op = opt.apply_gradients(zip(pi_grads + vf_grads, pi_vs + vf_vs), global_step=self.global_step)
 
             # for grad, var in zip(pi_grads + vf_grads, pi_vs + vf_vs):
             #     tf.summary.histogram(var.name, grad)
 
-        with tf.variable_scope('update_old_pi'):
-            self.update_oldpi_op = [oldp.assign(p) for p, oldp in zip(pi_params, oldpi_params)]
+        with tf.variable_scope('update_old'):
+            self.update_pi_old_op = [oldp.assign(p) for p, oldp in zip(pi_params, pi_old_params)]
+            self.update_vf_old_op = [oldp.assign(p) for p, oldp in zip(vf_params, vf_old_params)]
 
         self.writer = tf.summary.FileWriter(SUMMARY_DIR, self.sess.graph)
         self.sess.run(tf.global_variables_initializer())
@@ -126,6 +140,13 @@ class PPO(object):
         w_reg = tf.contrib.layers.l2_regularizer(L2_REG)
 
         with tf.variable_scope(name, reuse=reuse):
+            if self.cnn:
+                scaled = tf.cast(state_in, tf.float32) / 255.
+                conv1 = tf.layers.conv2d(inputs=scaled, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
+                conv2 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=4, strides=2, activation=tf.nn.relu)
+                conv3 = tf.layers.conv2d(inputs=conv2, filters=64, kernel_size=3, strides=1, activation=tf.nn.relu)
+                state_in = tf.layers.flatten(conv3)
+
             l1 = tf.layers.dense(state_in, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l1")
             l2 = tf.layers.dense(l1, LSTM_UNITS, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l2")
 
@@ -142,8 +163,8 @@ class PPO(object):
 
             mu = tf.layers.dense(a_cell_out, self.a_dim, tf.nn.tanh, kernel_regularizer=w_reg,
                                  name="pi_mu", use_bias=False)
-            sigma = tf.get_variable(name="pi_sigma", shape=self.a_dim, initializer=tf.ones_initializer())
-            norm_dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.maximum(sigma, 0.1))
+            log_sigma = tf.get_variable(name="pi_sigma", shape=self.a_dim, initializer=tf.zeros_initializer())
+            norm_dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.maximum(tf.exp(log_sigma), 0.1))
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
         return norm_dist, params, a_init_state, a_final_state
 
@@ -151,6 +172,13 @@ class PPO(object):
         w_reg = tf.contrib.layers.l2_regularizer(L2_REG)
 
         with tf.variable_scope(name, reuse=reuse):
+            if self.cnn:
+                scaled = tf.cast(state_in, tf.float32) / 255.
+                conv1 = tf.layers.conv2d(inputs=scaled, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
+                conv2 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=4, strides=2, activation=tf.nn.relu)
+                conv3 = tf.layers.conv2d(inputs=conv2, filters=64, kernel_size=3, strides=1, activation=tf.nn.relu)
+                state_in = tf.layers.flatten(conv3)
+
             l1 = tf.layers.dense(state_in, 400, tf.nn.relu, kernel_regularizer=w_reg, name="vf_l1")
             l2 = tf.layers.dense(l1, LSTM_UNITS, tf.nn.relu, kernel_regularizer=w_reg, name="vf_l2")
 
@@ -171,9 +199,10 @@ class PPO(object):
 
     def update(self, exp):
         start, e_time = time(), []
-        self.sess.run([self.update_oldpi_op])
+        self.sess.run([self.update_pi_old_op, self.update_vf_old_op])
 
         for _ in range(EPOCHS):
+            np.random.shuffle(exp)
             for ep_s, ep_a, ep_r, ep_adv in exp:
 
                 # Trim down to round minibatches
@@ -203,13 +232,13 @@ class PPO(object):
 
     def eval_state(self, state, a_state, c_state, stochastic=True):
         if stochastic:
-            eval_ops = [self.sample_op, self.evalvf, self.evalpi_f_state, self.evalvf_f_state]
+            eval_ops = [self.sample_op, self.vf_eval, self.evalpi_f_state, self.vf_eval_f_state]
         else:
-            eval_ops = [self.eval_action, self.evalvf, self.evalpi_f_state, self.evalvf_f_state]
+            eval_ops = [self.eval_action, self.vf_eval, self.evalpi_f_state, self.vf_eval_f_state]
 
         a, v, a_state, c_state = self.sess.run(eval_ops,
                                                {self.state: state[np.newaxis, :],
-                                                self.evalpi_i_state: a_state, self.evalvf_i_state: c_state,
+                                                self.pi_eval_i_state: a_state, self.vf_eval_i_state: c_state,
                                                 self.keep_prob: 1.0})
         return a[0], v[0], a_state, c_state
 
@@ -247,6 +276,33 @@ def add_histogram(writer, tag, values, step, bins=1000):
     writer.add_summary(summary, step)
 
 
+class RunningStats(object):
+    # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
+    # https://github.com/openai/baselines/blob/master/baselines/common/running_mean_std.py
+    def __init__(self, epsilon=1e-4, shape=()):
+        self.mean = np.zeros(shape, 'float64')
+        self.var = np.ones(shape, 'float64')
+        self.count = epsilon
+
+    def update(self, x):
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        new_mean = self.mean + delta * batch_count / (self.count + batch_count)
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / (self.count + batch_count)
+        new_var = M2 / (self.count + batch_count)
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = batch_count + self.count
+
+
 def discount(x, gamma):
     return scipy.signal.lfilter([1], [1, -gamma], x[::-1], axis=0)[::-1]
 
@@ -258,19 +314,20 @@ ppo = PPO(env)
 t = 0
 buffer_s, buffer_a, buffer_r, buffer_v, terminals = [], [], [], [], []
 experience = []
+stats = RunningStats()
 
 for episode in range(EP_MAX + 1):
 
-    a_lstm_state, c_lstm_state = ppo.sess.run([ppo.evalpi_i_state, ppo.evalvf_i_state])  # Zero LSTM state at beginning
+    a_lstm_state, c_lstm_state = ppo.sess.run([ppo.pi_eval_i_state, ppo.vf_eval_i_state])  # Zero LSTM state
 
     s = env.reset()
-    ep_r, ep_t, terminal = 0, 0, True
+    ep_r, ep_t, terminal = 0, 0, False
     ep_a = []
 
     while True:
         a, v, a_lstm_state, c_lstm_state = ppo.eval_state(s, a_lstm_state, c_lstm_state)
 
-        if ep_t > 0 and terminal:
+        if terminal:
             print('Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
 
             v = [v[0] * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
@@ -279,13 +336,15 @@ for episode in range(EP_MAX + 1):
             terminals_array = np.array(terminals + [0])
 
             # Generalized Advantage Estimation - https://arxiv.org/abs/1506.02438
-            advantage = discount(rewards + GAMMA * vpred[1:] * (1 - terminals_array[1:]) - vpred[:-1], GAMMA * LAMBDA)
-            tdlamret = advantage + np.array(buffer_v)
-            advantage = (advantage - advantage.mean()) / np.maximum(advantage.std(), 1e-6)
+            delta = rewards + GAMMA * vpred[1:] * (1 - terminals_array[1:]) - vpred[:-1]
+            advantage = discount(delta, GAMMA * LAMBDA)
+            td_lambda_returns = advantage + np.array(buffer_v)
+            advantage = (advantage - np.mean(advantage)) / np.maximum(np.std(advantage), 1e-6)
 
             if len(rewards) >= MINIBATCH:  # Ignore episodes shorter than a minibatch
-                bs, ba, br, badv = np.vstack(buffer_s), np.vstack(buffer_a), np.vstack(tdlamret), np.vstack(advantage)
-                experience.append((bs, ba, br, badv))
+                bs, ba, br, badv = np.reshape(buffer_s, (ep_t,) + ppo.s_dim), np.vstack(buffer_a), \
+                                   np.vstack(td_lambda_returns), np.vstack(advantage)
+                experience.append([bs, ba, br, badv])
             else:
                 t -= len(rewards)
 
@@ -293,6 +352,11 @@ for episode in range(EP_MAX + 1):
 
             # Update PPO
             if t >= BATCH:
+                # Per batch normalisation of advantages
+                # advs = np.concatenate(list(zip(*experience))[3])
+                # for x in experience:
+                #     x[3] = (x[3] - np.mean(advs)) / np.maximum(np.std(advs), 1e-6)
+
                 print("Training using %i episodes and %i steps..." % (len(experience), t))
                 graph_summary = ppo.update(experience)
                 t, experience = 0, []
@@ -333,7 +397,7 @@ env = gym.make(ENVIRONMENT)
 while True:
     s = env.reset()
     ep_r, ep_t = 0, 0
-    a_lstm_state, c_lstm_state = ppo.sess.run([ppo.evalpi_i_state, ppo.evalvf_i_state])
+    a_lstm_state, c_lstm_state = ppo.sess.run([ppo.pi_eval_i_state, ppo.vf_eval_i_state])
     while True:
         env.render()
         a, v, a_lstm_state, c_lstm_state = ppo.eval_state(s, a_lstm_state, c_lstm_state, stochastic=False)
