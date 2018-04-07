@@ -4,11 +4,11 @@ literature implemented in TensorFlow.
 Most of my research is in the continuous domain, and I haven't spent much
 time testing these in discrete domains such as Atari etc.
 
-![PPO LSTM solving BipedalWalker-v2](https://github.com/Anjum48/rl-examples/blob/master/ppo/BipedalWalker_PPO-LSTM.gif)
-
-![PPO LSTM solving BipedalWalker-v2](https://github.com/Anjum48/rl-examples/blob/master/ppo/BipedalWalker_PPO-LSTM.png)
+![PPO LSTM solving BipedalWalker-v2](https://github.com/Anjum48/rl-examples/blob/master/ppo/BipedalWalker-v2.gif)
+![PPO solving CarRacing-v0](https://github.com/Anjum48/rl-examples/blob/master/ppo/CarRacing-v0.gif)
 
 *BipedalWalker-v2 solved using PPO with a LSTM layer*
+*CarRacing-v0 solved using PPO with a joined actor-critic network*
 
 ## Algorithms Implemented
 Thanks to DeepMind and OpenAI for making their research openly available.
