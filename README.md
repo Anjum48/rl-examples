@@ -46,6 +46,6 @@ For my setup, there was usually no speed advantage training BipedalWalker on the
 CPU vs GPU (GTX 1080), but CarRacing did get a performance boost due to the usage of CNN layers
 
 ## Issues/Todo's
-- The LSTM batching in A3C is incorrect. Need to fix this (see PPO_LSTM for the correct implementation)
+- The LSTM batching in A3C is incorrect. Need to fix this (see `ppo_lstm.py` for the correct implementation)
 - Distributed Proximal Policy Optimisation with the LSTM (`dppo_lstm.py`) is sometimes a bit unstable,
 but does work at low learning rates
