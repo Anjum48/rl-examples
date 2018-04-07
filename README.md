@@ -7,9 +7,7 @@ time testing these in discrete domains such as Atari etc.
 ![PPO LSTM solving BipedalWalker-v2](https://github.com/Anjum48/rl-examples/blob/master/ppo/BipedalWalker-v2.gif)
 ![PPO solving CarRacing-v0](https://github.com/Anjum48/rl-examples/blob/master/ppo/CarRacing-v0.gif)
 
-*BipedalWalker-v2 solved using PPO with a LSTM layer*
-
-*CarRacing-v0 solved using PPO with a joined actor-critic network*
+*BipedalWalker-v2 solved using DPPO with a LSTM layer. CarRacing-v0 solved using PPO with a joined actor-critic network*
 
 ## Algorithms Implemented
 Thanks to DeepMind and OpenAI for making their research openly available.
@@ -45,7 +43,7 @@ DPPO has a helper script to set off the worker threads
 DPPO was tested on a 16 core machine using CPU only, so the helper
 script will need to be updated for your particular setup.
 For my setup, there was usually no speed advantage training BipedalWalker on the
-CPU vs GPU (GTX 1080), but CarRacing did get a performance boost due to the usage of CNNs
+CPU vs GPU (GTX 1080), but CarRacing did get a performance boost due to the usage of CNN layers
 
 ## Issues/Todo's
 - The LSTM batching in A3C is incorrect. Need to fix this (see PPO_LSTM for the correct implementation)
