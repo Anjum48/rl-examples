@@ -8,6 +8,7 @@ time testing these in discrete domains such as Atari etc.
 ![PPO solving CarRacing-v0](https://github.com/Anjum48/rl-examples/blob/master/ppo/CarRacing-v0.gif)
 
 *BipedalWalker-v2 solved using PPO with a LSTM layer*
+
 *CarRacing-v0 solved using PPO with a joined actor-critic network*
 
 ## Algorithms Implemented
