@@ -1,12 +1,11 @@
 """
-A simple version of Proximal Policy Optimization (PPO) using single thread and an LSTM layer.
+A simple version of Proximal Policy Optimization (ppo) using single thread and an LSTM layer.
 
 Based on:
 1. Emergence of Locomotion Behaviours in Rich Environments (Google Deepmind): [https://arxiv.org/abs/1707.02286]
 2. Proximal Policy Optimization Algorithms (OpenAI): [https://arxiv.org/abs/1707.06347]
 3. Generalized Advantage Estimation [https://arxiv.org/abs/1506.02438]
 
-Thanks to OpenAI and morvanzhou for their examples
 """
 
 import tensorflow as tf
@@ -19,20 +18,13 @@ from datetime import datetime
 from time import time
 OUTPUT_RESULTS_DIR = "./"
 
-# ENVIRONMENT = 'Pendulum-v0'
-# ENVIRONMENT = 'MountainCarContinuous-v0'
-# ENVIRONMENT = 'LunarLanderContinuous-v2'
-# ENVIRONMENT = 'BipedalWalker-v2'
-# ENVIRONMENT = 'BipedalWalkerHardcore-v2'
-ENVIRONMENT = 'CarRacing-v0'
-
 EP_MAX = 10000
 GAMMA = 0.99
 LAMBDA = 0.95
 ENTROPY_BETA = 0.0
 LR = 0.00005
 BATCH = 8192
-MINIBATCH = 64
+MINIBATCH = 32
 EPOCHS = 10
 EPSILON = 0.1
 VF_COEFF = 1.0
@@ -40,23 +32,31 @@ L2_REG = 0.001
 LSTM_UNITS = 128
 LSTM_LAYERS = 1
 KEEP_PROB = 0.8
+SIGMA_FLOOR = 0.1  # Useful to set this to a non-zero number since the LSTM can make sigma drop too quickly
 
-TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
-SUMMARY_DIR = os.path.join(OUTPUT_RESULTS_DIR, "PPO_LSTM", ENVIRONMENT, TIMESTAMP)
+# MODEL_RESTORE_PATH = "/mnt/sdb1/rl-examples/PPO_LSTM/Pendulum-v0/20180523-193806"
+MODEL_RESTORE_PATH = None
 
 
 class PPO(object):
-    def __init__(self, environment):
-        self.s_dim, self.a_dim = environment.observation_space.shape, environment.action_space.shape[0]
-        self.a_bound = environment.action_space.high
+    def __init__(self, environment, summary_dir="./", gpu=False):
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+        config = tf.ConfigProto(log_device_placement=False, device_count={'GPU': gpu})
+        config.gpu_options.per_process_gpu_memory_fraction = 0.1
+
+        if len(environment.action_space.shape) > 0:
+            self.discrete = False
+            self.s_dim, self.a_dim = environment.observation_space.shape, environment.action_space.shape[0]
+            self.a_bound = environment.action_space.high
+            self.actions = tf.placeholder(tf.float32, [None, self.a_dim], 'action')
+        else:
+            self.discrete = True
+            self.s_dim, self.a_dim = environment.observation_space.shape, environment.action_space.n
+            self.actions = tf.placeholder(tf.int32, [None, 1], 'action')
         self.cnn = len(self.s_dim) == 3
 
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-        config = tf.ConfigProto(log_device_placement=False, device_count={'GPU': 1})  # 1 for GPU, 0 for CPU
-        config.gpu_options.per_process_gpu_memory_fraction = 0.1
         self.sess = tf.Session(config=config)
         self.state = tf.placeholder(tf.float32, [None] + list(self.s_dim), 'state')
-        self.actions = tf.placeholder(tf.float32, [None, self.a_dim], 'action')
         self.advantage = tf.placeholder(tf.float32, [None, 1], 'advantage')
         self.rewards = tf.placeholder(tf.float32, [None, 1], 'discounted_r')
         self.keep_prob = tf.placeholder(tf.float32, name='dropout_keep_prob')
@@ -80,7 +80,8 @@ class PPO(object):
         self.vf_eval, _, self.vf_eval_i_state, self.vf_eval_f_state = self._build_cnet(self.state, 'vf', reuse=True, batch_size=1)
 
         self.sample_op = tf.squeeze(pi_eval.sample(1), axis=0, name="sample_action")
-        self.eval_action = pi_eval.loc
+        self.eval_action = pi_eval.mode()  # Used mode for discrete case. Mode should equal mean in continuous
+        self.saver = tf.train.Saver(max_to_keep=100)
 
         with tf.variable_scope('loss'):
             epsilon_decay = tf.train.polynomial_decay(EPSILON, self.global_step, 1e5, 0.01, power=0.0)
@@ -102,13 +103,13 @@ class PPO(object):
                 # loss_vf = tf.reduce_mean(tf.square(self.v - batch["rewards"])) * 0.5
                 tf.summary.scalar("loss", loss_vf)
 
-            with tf.variable_scope('entropy_bonus'):
+            with tf.variable_scope('entropy'):
                 entropy = pi.entropy()
                 pol_entpen = -ENTROPY_BETA * tf.reduce_mean(entropy)
 
             loss = loss_pi + loss_vf * VF_COEFF + pol_entpen
             tf.summary.scalar("total", loss)
-            tf.summary.scalar("epsilon", epsilon_decay)
+            # tf.summary.scalar("epsilon", epsilon_decay)
 
         with tf.variable_scope('train'):
             opt = tf.train.AdamOptimizer(LR)
@@ -129,11 +130,13 @@ class PPO(object):
             self.update_pi_old_op = [oldp.assign(p) for p, oldp in zip(pi_params, pi_old_params)]
             self.update_vf_old_op = [oldp.assign(p) for p, oldp in zip(vf_params, vf_old_params)]
 
-        self.writer = tf.summary.FileWriter(SUMMARY_DIR, self.sess.graph)
+        self.writer = tf.summary.FileWriter(summary_dir, self.sess.graph)
         self.sess.run(tf.global_variables_initializer())
 
-        tf.summary.scalar("Value", tf.reduce_mean(self.v))
-        tf.summary.scalar("Sigma", tf.reduce_mean(pi.scale))
+        tf.summary.scalar("value", tf.reduce_mean(self.v))
+        tf.summary.scalar("policy_entropy", tf.reduce_mean(entropy))
+        if not self.discrete:
+            tf.summary.scalar("sigma", tf.reduce_mean(pi.stddev()))
         self.summarise = tf.summary.merge(tf.get_collection(tf.GraphKeys.SUMMARIES))
 
     def _build_anet(self, state_in, name, reuse=False, batch_size=MINIBATCH):
@@ -161,12 +164,15 @@ class PPO(object):
             a_outputs, a_final_state = tf.nn.dynamic_rnn(cell=a_lstm, inputs=lstm_in, initial_state=a_init_state)
             a_cell_out = tf.reshape(a_outputs, [-1, LSTM_UNITS], name='flatten_lstm_outputs')
 
-            mu = tf.layers.dense(a_cell_out, self.a_dim, tf.nn.tanh, kernel_regularizer=w_reg,
-                                 name="pi_mu", use_bias=False)
-            log_sigma = tf.get_variable(name="pi_sigma", shape=self.a_dim, initializer=tf.zeros_initializer())
-            norm_dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.maximum(tf.exp(log_sigma), 0.1))
+            if self.discrete:
+                a_logits = tf.layers.dense(a_cell_out, self.a_dim, kernel_regularizer=w_reg, name="pi_logits")
+                dist = tf.distributions.Categorical(logits=a_logits)
+            else:
+                mu = tf.layers.dense(a_cell_out, self.a_dim, tf.nn.tanh, kernel_regularizer=w_reg, name="pi_mu")
+                log_sigma = tf.get_variable(name="pi_sigma", shape=self.a_dim, initializer=tf.zeros_initializer())
+                dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.maximum(tf.exp(log_sigma), SIGMA_FLOOR))
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
-        return norm_dist, params, a_init_state, a_final_state
+        return dist, params, a_init_state, a_final_state
 
     def _build_cnet(self, state_in, name, reuse=False, batch_size=MINIBATCH):
         w_reg = tf.contrib.layers.l2_regularizer(L2_REG)
@@ -196,6 +202,14 @@ class PPO(object):
             vf = tf.layers.dense(c_cell_out, 1, kernel_regularizer=w_reg, name="vf_out")
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
         return vf, params, c_init_state, c_final_state
+
+    def save_model(self, model_path, step=None):
+        save_path = self.saver.save(self.sess, os.path.join(model_path, "model.ckpt"), global_step=step)
+        return save_path
+
+    def restore_model(self, model_path):
+        self.saver.restore(self.sess, os.path.join(model_path, "model.ckpt"))
+        print("Model restored from", model_path)
 
     def update(self, exp):
         start, e_time = time(), []
@@ -227,20 +241,21 @@ class PPO(object):
                     except tf.errors.OutOfRangeError:
                         break
 
-        print("Trained in %.3fs. Average %.3fs/batch. Global step %i" % (time() - start, np.mean(e_time), step))
+        print("Trained in %.3fs. Average %.3fs/minibatch. Global step %i" % (time() - start, np.mean(e_time), step))
         return summary
 
-    def eval_state(self, state, a_state, c_state, stochastic=True):
+    def evaluate_state(self, state, lstm_state, stochastic=True):
         if stochastic:
             eval_ops = [self.sample_op, self.vf_eval, self.evalpi_f_state, self.vf_eval_f_state]
         else:
             eval_ops = [self.eval_action, self.vf_eval, self.evalpi_f_state, self.vf_eval_f_state]
 
-        a, v, a_state, c_state = self.sess.run(eval_ops,
-                                               {self.state: state[np.newaxis, :],
-                                                self.pi_eval_i_state: a_state, self.vf_eval_i_state: c_state,
-                                                self.keep_prob: 1.0})
-        return a[0], v[0], a_state, c_state
+        action, value, a_state, c_state = self.sess.run(eval_ops,
+                                                        {self.state: state[np.newaxis, :],
+                                                         self.pi_eval_i_state: lstm_state[0],
+                                                         self.vf_eval_i_state: lstm_state[1],
+                                                         self.keep_prob: 1.0})
+        return action[0], np.squeeze(value), (a_state, c_state)
 
 
 def add_histogram(writer, tag, values, step, bins=1000):
@@ -303,107 +318,148 @@ class RunningStats(object):
         self.count = batch_count + self.count
 
 
-def discount(x, gamma):
-    return scipy.signal.lfilter([1], [1, -gamma], x[::-1], axis=0)[::-1]
+def discount(x, gamma, terminal_array=None):
+    if terminal_array is None:
+        return scipy.signal.lfilter([1], [1, -gamma], x[::-1], axis=0)[::-1]
+    else:
+        y, adv = 0, []
+        terminals_reversed = terminal_array[1:][::-1]
+        for step, dt in enumerate(reversed(x)):
+            y = dt + gamma * y * (1 - terminals_reversed[step])
+            adv.append(y)
+        return np.array(adv)[::-1]
 
 
-env = gym.make(ENVIRONMENT)
-env = wrappers.Monitor(env, os.path.join(SUMMARY_DIR, ENVIRONMENT), video_callable=None)
-ppo = PPO(env)
+if __name__ == '__main__':
+    # Discrete environments
+    # ENVIRONMENT = 'CartPole-v1'
+    # ENVIRONMENT = 'MountainCar-v0'
+    # ENVIRONMENT = 'LunarLander-v2'
+    # ENVIRONMENT = 'Breakout-v0'
 
-t = 0
-buffer_s, buffer_a, buffer_r, buffer_v, terminals = [], [], [], [], []
-experience = []
-stats = RunningStats()
+    # Continuous environments
+    ENVIRONMENT = 'Pendulum-v0'
+    # ENVIRONMENT = 'MountainCarContinuous-v0'
+    # ENVIRONMENT = 'LunarLanderContinuous-v2'
+    # ENVIRONMENT = 'BipedalWalker-v2'
+    # ENVIRONMENT = 'BipedalWalkerHardcore-v2'
+    # ENVIRONMENT = 'CarRacing-v0'
 
-for episode in range(EP_MAX + 1):
+    TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
+    SUMMARY_DIR = os.path.join(OUTPUT_RESULTS_DIR, "PPO_LSTM", ENVIRONMENT, TIMESTAMP)
 
-    a_lstm_state, c_lstm_state = ppo.sess.run([ppo.pi_eval_i_state, ppo.vf_eval_i_state])  # Zero LSTM state
+    env = gym.make(ENVIRONMENT)
+    env = wrappers.Monitor(env, os.path.join(SUMMARY_DIR, ENVIRONMENT), video_callable=None)
+    ppo = PPO(env, SUMMARY_DIR)
 
-    s = env.reset()
-    ep_r, ep_t, terminal = 0, 0, False
-    ep_a = []
+    if MODEL_RESTORE_PATH is not None:
+        ppo.restore_model(MODEL_RESTORE_PATH)
 
-    while True:
-        a, v, a_lstm_state, c_lstm_state = ppo.eval_state(s, a_lstm_state, c_lstm_state)
+    t = 0
+    buffer_s, buffer_a, buffer_r, buffer_v, buffer_terminal = [], [], [], [], []
+    experience = []
+    stats = RunningStats()
 
-        if terminal:
-            print('Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
+    for episode in range(EP_MAX + 1):
 
-            v = [v[0] * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
-            rewards = np.array(buffer_r)
-            vpred = np.array(buffer_v + v)
-            terminals_array = np.array(terminals + [0])
+        lstm_state = ppo.sess.run([ppo.pi_eval_i_state, ppo.vf_eval_i_state])  # Zero LSTM state
 
-            # Generalized Advantage Estimation - https://arxiv.org/abs/1506.02438
-            delta = rewards + GAMMA * vpred[1:] * (1 - terminals_array[1:]) - vpred[:-1]
-            advantage = discount(delta, GAMMA * LAMBDA)
-            td_lambda_returns = advantage + np.array(buffer_v)
-            advantage = (advantage - np.mean(advantage)) / np.maximum(np.std(advantage), 1e-6)
+        s = env.reset()
+        ep_r, ep_t, terminal = 0, 0, False
+        ep_a = []
 
-            if len(rewards) >= MINIBATCH:  # Ignore episodes shorter than a minibatch
-                bs, ba, br, badv = np.reshape(buffer_s, (ep_t,) + ppo.s_dim), np.vstack(buffer_a), \
-                                   np.vstack(td_lambda_returns), np.vstack(advantage)
+        while True:
+            a, v, lstm_state = ppo.evaluate_state(s, lstm_state)
+
+            if terminal:
+                v_final = [v * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
+                rewards = np.array(buffer_r)
+                values = np.array(buffer_v + v_final)
+                terminals = np.array(buffer_terminal + [terminal])
+
+                # Generalized Advantage Estimation - https://arxiv.org/abs/1506.02438
+                delta = rewards + GAMMA * values[1:] * (1 - terminals[1:]) - values[:-1]
+                advantage = discount(delta, GAMMA * LAMBDA, terminals)
+                returns = advantage + np.array(buffer_v)
+                # Per episode normalisation of advantages
+                # advantage = (advantage - advantage.mean()) / np.maximum(advantage.std(), 1e-6)
+
+                bs, ba, br, badv = np.reshape(buffer_s, (len(buffer_s),) + ppo.s_dim), np.vstack(buffer_a), \
+                                   np.vstack(returns), np.vstack(advantage)
                 experience.append([bs, ba, br, badv])
-            else:
-                t -= len(rewards)
 
-            buffer_s, buffer_a, buffer_r, buffer_v, terminals = [], [], [], [], []
+                buffer_s, buffer_a, buffer_r, buffer_v, buffer_terminal = [], [], [], [], []
 
-            # Update PPO
-            if t >= BATCH:
-                # Per batch normalisation of advantages
-                # advs = np.concatenate(list(zip(*experience))[3])
-                # for x in experience:
-                #     x[3] = (x[3] - np.mean(advs)) / np.maximum(np.std(advs), 1e-6)
+                # Update ppo
+                if t >= BATCH:
+                    # Per batch normalisation of advantages
+                    advs = np.concatenate(list(zip(*experience))[3])
+                    for x in experience:
+                        x[3] = (x[3] - np.mean(advs)) / np.maximum(np.std(advs), 1e-6)
 
-                print("Training using %i episodes and %i steps..." % (len(experience), t))
-                graph_summary = ppo.update(experience)
-                t, experience = 0, []
+                    # print("Training using %i episodes and %i steps..." % (len(experience), t))
+                    graph_summary = ppo.update(experience)
+                    t, experience = 0, []
 
-            # End of episode summary
-            worker_summary = tf.Summary()
-            worker_summary.value.add(tag="Reward", simple_value=ep_r)
+                # End of episode summary
+                print('Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
 
-            # Create Action histograms for each dimension
-            actions = np.array(ep_a)
-            for a in range(ppo.a_dim):
-                add_histogram(ppo.writer, "Action/Dim" + str(a), actions[:, a], episode)
+                worker_summary = tf.Summary()
+                worker_summary.value.add(tag="Reward", simple_value=ep_r)
 
-            try:
-                ppo.writer.add_summary(graph_summary, episode)
-            except NameError:
-                pass
-            ppo.writer.add_summary(worker_summary, episode)
-            ppo.writer.flush()
-            break
+                # Create Action histograms for each dimension
+                actions = np.array(ep_a)
+                if ppo.discrete:
+                    add_histogram(ppo.writer, "Action", actions, episode, bins=ppo.a_dim)
+                else:
+                    for a in range(ppo.a_dim):
+                        add_histogram(ppo.writer, "Action/Dim" + str(a), actions[:, a], episode)
 
-        buffer_s.append(s)
-        buffer_a.append(a)
-        buffer_v.append(v[0])
-        terminals.append(terminal)
-        ep_a.append(a)
+                try:
+                    ppo.writer.add_summary(graph_summary, episode)
+                except NameError:
+                    pass
+                ppo.writer.add_summary(worker_summary, episode)
+                ppo.writer.flush()
 
-        s, r, terminal, _ = env.step(np.clip(a, -ppo.a_bound, ppo.a_bound))
-        buffer_r.append(r)
+                # Save the model
+                if episode % 100 == 0 and episode > 0:
+                    path = ppo.save_model(SUMMARY_DIR, episode)
+                    print('Saved model at episode', episode, 'in', path)
+                break
 
-        ep_r += r
-        ep_t += 1
-        t += 1
+            buffer_s.append(s)
+            buffer_a.append(a)
+            buffer_v.append(v)
+            buffer_terminal.append(terminal)
+            ep_a.append(a)
 
-env.close()
+            if not ppo.discrete:
+                a = np.clip(a, -ppo.a_bound, ppo.a_bound)
+            s, r, terminal, _ = env.step(a)
+            buffer_r.append(r)
 
-env = gym.make(ENVIRONMENT)
-while True:
-    s = env.reset()
-    ep_r, ep_t = 0, 0
-    a_lstm_state, c_lstm_state = ppo.sess.run([ppo.pi_eval_i_state, ppo.vf_eval_i_state])
+            ep_r += r
+            ep_t += 1
+            t += 1
+
+    env.close()
+
+    # Run trained policy
+    env = gym.make(ENVIRONMENT)
+    env = wrappers.Monitor(env, os.path.join(SUMMARY_DIR, ENVIRONMENT + "_trained"), video_callable=None)
     while True:
-        env.render()
-        a, v, a_lstm_state, c_lstm_state = ppo.eval_state(s, a_lstm_state, c_lstm_state, stochastic=False)
-        s, r, terminal, _ = env.step(np.clip(a, -ppo.a_bound, ppo.a_bound))
-        ep_r += r
-        ep_t += 1
-        if terminal:
-            print("Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
-            break
+        s = env.reset()
+        ep_r, ep_t = 0, 0
+        lstm_state = ppo.sess.run([ppo.pi_eval_i_state, ppo.vf_eval_i_state])
+        while True:
+            env.render()
+            a, v, lstm_state = ppo.evaluate_state(s, lstm_state, stochastic=False)
+            if not ppo.discrete:
+                a = np.clip(a, -ppo.a_bound, ppo.a_bound)
+            s, r, terminal, _ = env.step(a)
+            ep_r += r
+            ep_t += 1
+            if terminal:
+                print("Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
+                break

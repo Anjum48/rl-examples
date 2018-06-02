@@ -1,5 +1,5 @@
 """
-A simple version of Proximal Policy Optimization (PPO) using single thread and an LSTM layer.
+A simple version of Proximal Policy Optimization (ppo) using single thread and an LSTM layer.
 
 Based on:
 1. Emergence of Locomotion Behaviours in Rich Environments (Google Deepmind): [https://arxiv.org/abs/1707.02286]
@@ -17,14 +17,8 @@ import scipy.signal
 from gym import wrappers
 from datetime import datetime
 from time import time
-from Forex.fxsettings import OUTPUT_RESULTS_DIR
+OUTPUT_RESULTS_DIR = "./"
 
-# ENVIRONMENT = 'Pendulum-v0'
-# ENVIRONMENT = 'MountainCarContinuous-v0'
-# ENVIRONMENT = 'LunarLanderContinuous-v2'
-# ENVIRONMENT = 'BipedalWalker-v2'
-# ENVIRONMENT = 'BipedalWalkerHardcore-v2'
-ENVIRONMENT = 'CarRacing-v0'
 
 EP_MAX = 10000
 GAMMA = 0.99
@@ -32,7 +26,7 @@ LAMBDA = 0.95
 ENTROPY_BETA = 0.0
 LR = 0.00005
 BATCH = 8192
-MINIBATCH = 64
+MINIBATCH = 32
 EPOCHS = 10
 EPSILON = 0.1
 VF_COEFF = 1.0
@@ -40,19 +34,19 @@ L2_REG = 0.001
 LSTM_UNITS = 128
 LSTM_LAYERS = 1
 KEEP_PROB = 0.8
+SIGMA_FLOOR = 0.1  # Useful to set this to a non-zero number since the LSTM can make sigma drop too quickly
 
-TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
-SUMMARY_DIR = os.path.join(OUTPUT_RESULTS_DIR, "PPO_LSTM_Join", ENVIRONMENT, TIMESTAMP)
+MODEL_RESTORE_PATH = None
 
 
 class PPO(object):
-    def __init__(self, environment):
+    def __init__(self, environment, summary_dir="./", gpu=False):
         self.s_dim, self.a_dim = environment.observation_space.shape, environment.action_space.shape[0]
         self.a_bound = environment.action_space.high
         self.cnn = len(self.s_dim) == 3
 
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-        config = tf.ConfigProto(log_device_placement=False, device_count={'GPU': 1})  # 1 for GPU, 0 for CPU
+        config = tf.ConfigProto(log_device_placement=False, device_count={'GPU': gpu})  # 1 for GPU, 0 for CPU
         config.gpu_options.per_process_gpu_memory_fraction = 0.1
         self.sess = tf.Session(config=config)
         self.state = tf.placeholder(tf.float32, [None] + list(self.s_dim), 'state')
@@ -77,6 +71,7 @@ class PPO(object):
 
         self.sample_op = tf.squeeze(pi_eval.sample(1), axis=0, name="sample_action")
         self.eval_action = pi_eval.loc
+        self.saver = tf.train.Saver()
 
         with tf.variable_scope('loss'):
             epsilon_decay = tf.train.polynomial_decay(EPSILON, self.global_step, 1e5, 0.01, power=0.0)
@@ -98,7 +93,7 @@ class PPO(object):
                 # loss_vf = tf.reduce_mean(tf.square(self.v - batch["rewards"])) * 0.5
                 tf.summary.scalar("loss", loss_vf)
 
-            with tf.variable_scope('entropy_bonus'):
+            with tf.variable_scope('entropy'):
                 entropy = pi.entropy()
                 pol_entpen = -ENTROPY_BETA * tf.reduce_mean(entropy)
 
@@ -117,11 +112,12 @@ class PPO(object):
         with tf.variable_scope('update_old'):
             self.update_old_op = [oldp.assign(p) for p, oldp in zip(params, old_params)]
 
-        self.writer = tf.summary.FileWriter(SUMMARY_DIR, self.sess.graph)
+        self.writer = tf.summary.FileWriter(summary_dir, self.sess.graph)
         self.sess.run(tf.global_variables_initializer())
 
-        tf.summary.scalar("Value", tf.reduce_mean(self.v))
-        tf.summary.scalar("Sigma", tf.reduce_mean(pi.scale))
+        tf.summary.scalar("value", tf.reduce_mean(self.v))
+        tf.summary.scalar("sigma", tf.reduce_mean(pi.scale))
+        tf.summary.scalar("policy_entropy", tf.reduce_mean(entropy))
         self.summarise = tf.summary.merge(tf.get_collection(tf.GraphKeys.SUMMARIES))
 
     def _build_net(self, state_in, name, reuse=False, batch_size=MINIBATCH):
@@ -151,10 +147,18 @@ class PPO(object):
 
             mu = tf.layers.dense(cell_out, self.a_dim, tf.nn.tanh, kernel_regularizer=w_reg, name="pi_mu")
             log_sigma = tf.get_variable(name="pi_log_sigma", shape=self.a_dim, initializer=tf.zeros_initializer())
-            norm_dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.maximum(tf.exp(log_sigma), 0.1))
+            norm_dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.maximum(tf.exp(log_sigma), SIGMA_FLOOR))
             vf = tf.layers.dense(cell_out, 1, kernel_regularizer=w_reg, name="vf_out")
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
         return norm_dist, vf, params, init_state, final_state
+
+    def save_model(self, model_path, step=None):
+        save_path = self.saver.save(self.sess, os.path.join(model_path, "model.ckpt"), global_step=step)
+        return save_path
+
+    def restore_model(self, model_path):
+        self.saver.restore(self.sess, os.path.join(model_path, "model.ckpt"))
+        print("Model restored from", model_path)
 
     def update(self, exp):
         start, e_time = time(), []
@@ -239,60 +243,73 @@ def discount(x, gamma):
     return scipy.signal.lfilter([1], [1, -gamma], x[::-1], axis=0)[::-1]
 
 
-env = gym.make(ENVIRONMENT)
-env = wrappers.Monitor(env, os.path.join(SUMMARY_DIR, ENVIRONMENT), video_callable=None)
-ppo = PPO(env)
+if __name__ == '__main__':
+    # ENVIRONMENT = 'Pendulum-v0'
+    # ENVIRONMENT = 'MountainCarContinuous-v0'
+    # ENVIRONMENT = 'LunarLanderContinuous-v2'
+    # ENVIRONMENT = 'BipedalWalker-v2'
+    # ENVIRONMENT = 'BipedalWalkerHardcore-v2'
+    ENVIRONMENT = 'CarRacing-v0'
 
-t = 0
-buffer_s, buffer_a, buffer_r, buffer_v, terminals = [], [], [], [], []
-experience = []
+    TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
+    SUMMARY_DIR = os.path.join(OUTPUT_RESULTS_DIR, "PPO_LSTM_Joined", ENVIRONMENT, TIMESTAMP)
 
-for episode in range(EP_MAX):
+    env = gym.make(ENVIRONMENT)
+    env = wrappers.Monitor(env, os.path.join(SUMMARY_DIR, ENVIRONMENT), video_callable=None)
+    ppo = PPO(env, SUMMARY_DIR)
 
-    lstm_state = ppo.sess.run(ppo.eval_i_state)  # Zero LSTM state at beginning
+    if MODEL_RESTORE_PATH is not None:
+        ppo.restore_model(MODEL_RESTORE_PATH)
 
-    s = env.reset()
-    ep_r, ep_t, terminal = 0, 0, False
-    ep_a = []
+    t = 0
+    buffer_s, buffer_a, buffer_r, buffer_v, terminals = [], [], [], [], []
+    experience = []
 
-    while True:
-        a, v, lstm_state = ppo.eval_state(s, lstm_state)
+    for episode in range(EP_MAX):
 
-        if terminal:
-            print('Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
+        lstm_state = ppo.sess.run(ppo.eval_i_state)  # Zero LSTM state at beginning
 
-            v = [v[0] * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
-            rewards = np.array(buffer_r)
-            vpred = np.array(buffer_v + v)
-            terminals_array = np.array(terminals + [0])
+        s = env.reset()
+        ep_r, ep_t, terminal = 0, 0, False
+        ep_a = []
 
-            # Generalized Advantage Estimation - https://arxiv.org/abs/1506.02438
-            delta = rewards + GAMMA * vpred[1:] * (1 - terminals_array[1:]) - vpred[:-1]
-            advantage = discount(delta, GAMMA * LAMBDA)
-            td_lambda_returns = advantage + np.array(buffer_v)
-            advantage = (advantage - np.mean(advantage)) / np.maximum(np.std(advantage), 1e-6)
+        while True:
+            a, v, lstm_state = ppo.eval_state(s, lstm_state)
 
-            if len(rewards) >= MINIBATCH:
-                bs, ba, br, badv = np.reshape(buffer_s, (ep_t,) + ppo.s_dim), np.vstack(buffer_a), \
-                                   np.vstack(td_lambda_returns), np.vstack(advantage)
-                experience.append([bs, ba, br, badv])
-            else:
-                t -= len(rewards)
+            if terminal:
+                print('Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
 
-            buffer_s, buffer_a, buffer_r, buffer_v, terminals = [], [], [], [], []
+                v = [v[0] * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
+                rewards = np.array(buffer_r)
+                vpred = np.array(buffer_v + v)
+                terminals_array = np.array(terminals + [0])
 
-            # Update PPO
-            if t >= BATCH:
-                # Per batch normalisation of advantages
-                # advs = np.concatenate(list(zip(*experience))[3])
-                # for x in experience:
-                #     x[3] = (x[3] - np.mean(advs)) / np.maximum(np.std(advs), 1e-6)
+                # Generalized Advantage Estimation - https://arxiv.org/abs/1506.02438
+                delta = rewards + GAMMA * vpred[1:] * (1 - terminals_array[1:]) - vpred[:-1]
+                advantage = discount(delta, GAMMA * LAMBDA)
+                td_lambda_returns = advantage + np.array(buffer_v)
+                # advantage = (advantage - np.mean(advantage)) / np.maximum(np.std(advantage), 1e-6)
+
+                if len(rewards) >= MINIBATCH:
+                    bs, ba, br, badv = np.reshape(buffer_s, (ep_t,) + ppo.s_dim), np.vstack(buffer_a), \
+                                       np.vstack(td_lambda_returns), np.vstack(advantage)
+                    experience.append([bs, ba, br, badv])
+                else:
+                    t -= len(rewards)
+
+                buffer_s, buffer_a, buffer_r, buffer_v, terminals = [], [], [], [], []
+
+                # Update ppo
+                if t >= BATCH:
+                    # Per batch normalisation of advantages
+                    advs = np.concatenate(list(zip(*experience))[3])
+                    for x in experience:
+                        x[3] = (x[3] - np.mean(advs)) / np.maximum(np.std(advs), 1e-6)
 
                 print("Training using %i episodes and %i steps..." % (len(experience), t))
                 graph_summary = ppo.update(experience)
                 t, experience = 0, []
 
-            if terminal:
                 # End of episode summary
                 worker_summary = tf.Summary()
                 worker_summary.value.add(tag="Reward", simple_value=ep_r)
@@ -308,30 +325,35 @@ for episode in range(EP_MAX):
                     pass
                 ppo.writer.add_summary(worker_summary, episode)
                 ppo.writer.flush()
+
+                # Save the model
+                if episode % 100 == 0 and episode > 0:
+                    path = ppo.save_model(SUMMARY_DIR, episode)
+                    print('Saved model at episode', episode, 'in', path)
                 break
 
-        buffer_s.append(s)
-        buffer_a.append(a)
-        buffer_v.append(v[0])
-        terminals.append(terminal)
-        ep_a.append(a)
+            buffer_s.append(s)
+            buffer_a.append(a)
+            buffer_v.append(v[0])
+            terminals.append(terminal)
+            ep_a.append(a)
 
-        s, r, terminal, _ = env.step(np.clip(a, -ppo.a_bound, ppo.a_bound))
-        buffer_r.append(r)
+            s, r, terminal, _ = env.step(np.clip(a, -ppo.a_bound, ppo.a_bound))
+            buffer_r.append(r)
 
-        ep_r += r
-        ep_t += 1
-        t += 1
+            ep_r += r
+            ep_t += 1
+            t += 1
 
-env.close()
+    env.close()
 
-env = gym.make(ENVIRONMENT)
-while True:
-    s = env.reset()
-    lstm_state = ppo.sess.run(ppo.eval_i_state)
+    env = gym.make(ENVIRONMENT)
     while True:
-        env.render()
-        a, v, lstm_state = ppo.eval_state(s, lstm_state, stochastic=False)
-        s, r, terminal, _ = env.step(np.clip(a, -ppo.a_bound, ppo.a_bound))
-        if terminal:
-            break
+        s = env.reset()
+        lstm_state = ppo.sess.run(ppo.eval_i_state)
+        while True:
+            env.render()
+            a, v, lstm_state = ppo.eval_state(s, lstm_state, stochastic=False)
+            s, r, terminal, _ = env.step(np.clip(a, -ppo.a_bound, ppo.a_bound))
+            if terminal:
+                break
