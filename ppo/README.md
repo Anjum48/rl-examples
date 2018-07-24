@@ -23,7 +23,7 @@ If you have any suggestions, feel free to submit a PR!
 - Reward scaling can sometimes cause issues due to the -100 penalty
 - Works best with separate actor-critic networks when using LSTM e.g. `ppo_lstm.py`
 - Per episode advantage normalisation when using LSTM (instead of per batch) seems to be more stable
-- Small amount of L2 kernel regularisation e.g. 0.0001 helps smooth out the reward curve to get above 300 points
+- Small amount of L2 kernel regularisation e.g. 0.0001 helps smooth out the reward curve to get above 300 points. Scores around 320-330 are possible with the deterministic policy once trained
 
 ### `BipedalWalkerHardcore-v2`
 - Not solved - need a more robust exploration mechanism (curiosity?)
