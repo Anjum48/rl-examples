@@ -19,14 +19,15 @@ import scipy.signal
 from time import time
 from gym import wrappers
 from tensorflow.python.training.summary_io import SummaryWriterCache
+from utils import *
 OUTPUT_RESULTS_DIR = "./"
 
 
 EP_MAX = 10000
 GAMMA = 0.99
 LAMBDA = 0.95
-ENTROPY_BETA = 0.0
-LR = 0.00005
+ENTROPY_BETA = 0.01  # 0.01 for discrete, 0.0 for continuous
+LR = 0.0001
 BATCH = 8192
 MINIBATCH = 32
 EPOCHS = 10
@@ -41,7 +42,7 @@ PORT_OFFSET = 0  # number to offset the port from 2222. Useful for multiple runs
 
 
 class PPO(object):
-    def __init__(self, environment, wid):
+    def __init__(self, environment, wid, greyscale=True):
         if len(environment.action_space.shape) > 0:
             self.discrete = False
             self.s_dim, self.a_dim = environment.observation_space.shape, environment.action_space.shape[0]
@@ -52,6 +53,7 @@ class PPO(object):
             self.s_dim, self.a_dim = environment.observation_space.shape, environment.action_space.n
             self.actions = tf.placeholder(tf.int32, [None, 1], 'action')
         self.cnn = len(self.s_dim) == 3
+        self.greyscale = greyscale  # If not greyscale and using RGB, make sure to divide the images by 255
         self.wid = wid
         is_chief = wid == 0
 
@@ -63,7 +65,9 @@ class PPO(object):
         # Use the TensorFlow Dataset API
         self.dataset = tf.data.Dataset.from_tensor_slices({"state": self.state, "actions": self.actions,
                                                            "rewards": self.rewards, "advantage": self.advantage})
-        self.dataset = self.dataset.batch(MINIBATCH)
+        # self.dataset = self.dataset.batch(MINIBATCH)
+        # Trim to round minibatches
+        self.dataset = self.dataset.apply(tf.contrib.data.batch_and_drop_remainder(MINIBATCH))
         self.iterator = self.dataset.make_initializable_iterator()
         batch = self.iterator.get_next()
         self.global_step = tf.train.get_or_create_global_step()
@@ -141,8 +145,9 @@ class PPO(object):
 
         with tf.variable_scope(name, reuse=reuse):
             if self.cnn:
-                scaled = tf.cast(state_in, tf.float32) / 255.
-                conv1 = tf.layers.conv2d(inputs=scaled, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
+                if self.greyscale:
+                    state_in = tf.image.rgb_to_grayscale(state_in)
+                conv1 = tf.layers.conv2d(inputs=state_in, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
                 conv2 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=4, strides=2, activation=tf.nn.relu)
                 conv3 = tf.layers.conv2d(inputs=conv2, filters=64, kernel_size=3, strides=1, activation=tf.nn.relu)
                 state_in = tf.layers.flatten(conv3)
@@ -176,8 +181,9 @@ class PPO(object):
 
         with tf.variable_scope(name, reuse=reuse):
             if self.cnn:
-                scaled = tf.cast(state_in, tf.float32) / 255.
-                conv1 = tf.layers.conv2d(inputs=scaled, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
+                if self.greyscale:
+                    state_in = tf.image.rgb_to_grayscale(state_in)
+                conv1 = tf.layers.conv2d(inputs=state_in, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
                 conv2 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=4, strides=2, activation=tf.nn.relu)
                 conv3 = tf.layers.conv2d(inputs=conv2, filters=64, kernel_size=3, strides=1, activation=tf.nn.relu)
                 state_in = tf.layers.flatten(conv3)
@@ -207,13 +213,6 @@ class PPO(object):
         for k in range(EPOCHS):
             np.random.shuffle(exp)
             for ep_s, ep_a, ep_r, ep_adv in exp:
-
-                # Trim down to round minibatches
-                trim_index = (ep_s.shape[0] // MINIBATCH) * MINIBATCH
-                ep_s = ep_s[:trim_index]
-                ep_a = ep_a[:trim_index]
-                ep_r = ep_r[:trim_index]
-                ep_adv = ep_adv[:trim_index]
 
                 sess.run(self.iterator.initializer, feed_dict={self.state: ep_s, self.actions: ep_a,
                                                                self.rewards: ep_r, self.advantage: ep_adv})
@@ -300,18 +299,6 @@ class Worker(object):
         summary = tf.Summary(value=[tf.Summary.Value(tag=tag, histo=hist)])
         writer.add_summary(summary, step)
 
-    @staticmethod
-    def discount(x, gamma, terminal_array=None):
-        if terminal_array is None:
-            return scipy.signal.lfilter([1], [1, -gamma], x[::-1], axis=0)[::-1]
-        else:
-            y, adv = 0, []
-            terminals_reversed = terminal_array[1:][::-1]
-            for step, dt in enumerate(reversed(x)):
-                y = dt + gamma * y * (1 - terminals_reversed[step])
-                adv.append(y)
-            return np.array(adv)[::-1]
-
     def work(self):
         hooks = [self.ppo.sync_replicas_hook]
         sess = tf.train.MonitoredTrainingSession(master=self.server.target, is_chief=(self.wid == 0),
@@ -320,28 +307,33 @@ class Worker(object):
         if self.wid == 0:
             writer = SummaryWriterCache.get(SUMMARY_DIR)
 
-        t, episode = 0, 0
+        t, episode, terminal = 0, 0, False
         buffer_s, buffer_a, buffer_r, buffer_v, buffer_terminal = [], [], [], [], []
-        experience = []
+        rolling_r = RunningStats()
+        experience, batch_rewards = [], []
 
         while not sess.should_stop() and not (episode > EP_MAX and self.wid == 0):
             lstm_state = sess.run([self.ppo.pi_eval_i_state, self.ppo.vf_eval_i_state])  # Zero LSTM state
+
             s = self.env.reset()
-            ep_r, ep_t, terminal = 0, 0, False
-            ep_a = []
+            ep_r, ep_t, ep_a = 0, 0, []
 
             while True:
                 a, v, lstm_state = self.ppo.evaluate_state(s, lstm_state, sess)
 
                 if terminal:  # or t >= BATCH:
-                    v_final = [v * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
+                    # Normalise rewards
                     rewards = np.array(buffer_r)
+                    rewards = np.clip(rewards / rolling_r.std, -10, 10)
+                    batch_rewards = batch_rewards + buffer_r
+
+                    v_final = [v * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
                     values = np.array(buffer_v + v_final)
                     terminals = np.array(buffer_terminal + [terminal])
 
                     # Generalized Advantage Estimation - https://arxiv.org/abs/1506.02438
                     delta = rewards + GAMMA * values[1:] * (1 - terminals[1:]) - values[:-1]
-                    advantage = self.discount(delta, GAMMA * LAMBDA, terminals)
+                    advantage = discount(delta, GAMMA * LAMBDA, terminals)
                     returns = advantage + np.array(buffer_v)
                     # Per episode normalisation of advantages
                     # advantage = (advantage - advantage.mean()) / np.maximum(advantage.std(), 1e-6)
@@ -359,11 +351,15 @@ class Worker(object):
                         for x in experience:
                             x[3] = (x[3] - np.mean(advs)) / np.maximum(np.std(advs), 1e-6)
 
+                        # Update rolling reward stats
+                        rolling_r.update(np.array(batch_rewards))
+
                         # print("Training using %i episodes and %i steps..." % (len(experience), t))
                         graph_summary = self.ppo.update(experience, sess)
-                        t, experience = 0, []
+                        t, experience, batch_rewards = 0, [], []
 
-                    print('Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
+                    print('Worker_%i' % self.wid,
+                          '| Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
 
                     if self.wid == 0:
                         # End of episode summary
@@ -411,10 +407,17 @@ def main(_):
 
 
 if __name__ == '__main__':
+    # Discrete environments
+    # ENVIRONMENT = 'CartPole-v1'
+    # ENVIRONMENT = 'MountainCar-v0'
+    # ENVIRONMENT = 'LunarLander-v2'
+    ENVIRONMENT = 'Pong-v0'
+
+    # Continuous environments
     # ENVIRONMENT = 'Pendulum-v0'
     # ENVIRONMENT = 'MountainCarContinuous-v0'
     # ENVIRONMENT = 'LunarLanderContinuous-v2'
-    ENVIRONMENT = 'BipedalWalker-v2'
+    # ENVIRONMENT = 'BipedalWalker-v2'
     # ENVIRONMENT = 'BipedalWalkerHardcore-v2'
     # ENVIRONMENT = 'CarRacing-v0'
 

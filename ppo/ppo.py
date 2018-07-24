@@ -16,14 +16,15 @@ import scipy.signal
 from gym import wrappers
 from datetime import datetime
 from time import time
+from utils import *
 OUTPUT_RESULTS_DIR = "./"
 
 EP_MAX = 10000
 GAMMA = 0.99
 LAMBDA = 0.95
-ENTROPY_BETA = 0.0  # 0.01 for discrete, 0.0 for continuous
+ENTROPY_BETA = 0.01  # 0.01 for discrete, 0.0 for continuous
 LR = 0.0001
-BATCH = 2048
+BATCH = 8192  # 128 for discrete, 8192 for continuous
 MINIBATCH = 32
 EPOCHS = 10
 EPSILON = 0.1
@@ -31,12 +32,12 @@ VF_COEFF = 1.0
 L2_REG = 0.001
 SIGMA_FLOOR = 0.0
 
-# MODEL_RESTORE_PATH = "/mnt/sdb1/rl-examples/PPO/Pendulum-v0/20180523-191507"
+# MODEL_RESTORE_PATH = "/path/to/saved/model"
 MODEL_RESTORE_PATH = None
 
 
 class PPO(object):
-    def __init__(self, environment, summary_dir="./", gpu=False):
+    def __init__(self, environment, summary_dir="./", gpu=False, greyscale=True):
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
         config = tf.ConfigProto(log_device_placement=False, device_count={'GPU': gpu})
         config.gpu_options.per_process_gpu_memory_fraction = 0.1
@@ -51,6 +52,7 @@ class PPO(object):
             self.s_dim, self.a_dim = environment.observation_space.shape, environment.action_space.n
             self.actions = tf.placeholder(tf.int32, [None, 1], 'action')
         self.cnn = len(self.s_dim) == 3
+        self.greyscale = greyscale  # If not greyscale and using RGB, make sure to divide the images by 255
 
         self.sess = tf.Session(config=config)
         self.state = tf.placeholder(tf.float32, [None] + list(self.s_dim), 'state')
@@ -163,20 +165,21 @@ class PPO(object):
 
         with tf.variable_scope(name, reuse=reuse):
             if self.cnn:
-                scaled = tf.cast(state_in, tf.float32) / 255.
-                conv1 = tf.layers.conv2d(inputs=scaled, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
+                if self.greyscale:
+                    state_in = tf.image.rgb_to_grayscale(state_in)
+                conv1 = tf.layers.conv2d(inputs=state_in, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
                 conv2 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=4, strides=2, activation=tf.nn.relu)
                 conv3 = tf.layers.conv2d(inputs=conv2, filters=64, kernel_size=3, strides=1, activation=tf.nn.relu)
                 state_in = tf.layers.flatten(conv3)
 
-            l1 = tf.layers.dense(state_in, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l1")
-            l2 = tf.layers.dense(l1, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l2")
+            layer_1 = tf.layers.dense(state_in, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l1")
+            layer_2 = tf.layers.dense(layer_1, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l2")
 
             if self.discrete:
-                a_logits = tf.layers.dense(l2, self.a_dim, kernel_regularizer=w_reg, name="pi_logits")
+                a_logits = tf.layers.dense(layer_2, self.a_dim, kernel_regularizer=w_reg, name="pi_logits")
                 dist = tf.distributions.Categorical(logits=a_logits)
             else:
-                mu = tf.layers.dense(l2, self.a_dim, tf.nn.tanh, kernel_regularizer=w_reg, name="pi_mu")
+                mu = tf.layers.dense(layer_2, self.a_dim, tf.nn.tanh, kernel_regularizer=w_reg, name="pi_mu")
                 log_sigma = tf.get_variable(name="pi_sigma", shape=self.a_dim, initializer=tf.zeros_initializer())
                 dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.maximum(tf.exp(log_sigma), SIGMA_FLOOR))
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
@@ -187,8 +190,9 @@ class PPO(object):
 
         with tf.variable_scope(name, reuse=reuse):
             if self.cnn:
-                scaled = tf.cast(state_in, tf.float32) / 255.
-                conv1 = tf.layers.conv2d(inputs=scaled, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
+                if self.greyscale:
+                    state_in = tf.image.rgb_to_grayscale(state_in)
+                conv1 = tf.layers.conv2d(inputs=state_in, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
                 conv2 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=4, strides=2, activation=tf.nn.relu)
                 conv3 = tf.layers.conv2d(inputs=conv2, filters=64, kernel_size=3, strides=1, activation=tf.nn.relu)
                 state_in = tf.layers.flatten(conv3)
@@ -258,13 +262,13 @@ if __name__ == '__main__':
     # ENVIRONMENT = 'CartPole-v1'
     # ENVIRONMENT = 'MountainCar-v0'
     # ENVIRONMENT = 'LunarLander-v2'
-    # ENVIRONMENT = 'MsPacman-v0'
+    # ENVIRONMENT = 'Pong-v0'
 
     # Continuous environments
-    ENVIRONMENT = 'Pendulum-v0'
+    # ENVIRONMENT = 'Pendulum-v0'
     # ENVIRONMENT = 'MountainCarContinuous-v0'
     # ENVIRONMENT = 'LunarLanderContinuous-v2'
-    # ENVIRONMENT = 'BipedalWalker-v2'
+    ENVIRONMENT = 'BipedalWalker-v2'
     # ENVIRONMENT = 'BipedalWalkerHardcore-v2'
     # ENVIRONMENT = 'CarRacing-v0'
 
@@ -273,26 +277,31 @@ if __name__ == '__main__':
 
     env = gym.make(ENVIRONMENT)
     env = wrappers.Monitor(env, os.path.join(SUMMARY_DIR, ENVIRONMENT), video_callable=None)
-    ppo = PPO(env, SUMMARY_DIR)
+    ppo = PPO(env, SUMMARY_DIR, gpu=True)
 
     if MODEL_RESTORE_PATH is not None:
         ppo.restore_model(MODEL_RESTORE_PATH)
 
-    t = 0
+    t, terminal = 0, False
     buffer_s, buffer_a, buffer_r, buffer_v, buffer_terminal = [], [], [], [], []
+    rolling_r = RunningStats()
 
     for episode in range(EP_MAX + 1):
+
         s = env.reset()
-        ep_r, ep_t, terminal = 0, 0, False
-        ep_a = []
+        ep_r, ep_t, ep_a = 0, 0, []
 
         while True:
             a, v = ppo.evaluate_state(s)
 
             # Update ppo
             if t == BATCH:  # or (terminal and t < BATCH):
-                v_final = [v * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
+                # Normalise rewards
                 rewards = np.array(buffer_r)
+                rolling_r.update(rewards)
+                rewards = np.clip(rewards / rolling_r.std, -10, 10)
+
+                v_final = [v * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
                 values = np.array(buffer_v + v_final)
                 terminals = np.array(buffer_terminal + [terminal])
 
@@ -308,6 +317,21 @@ if __name__ == '__main__':
                 graph_summary = ppo.update(bs, ba, br, badv)
                 buffer_s, buffer_a, buffer_r, buffer_v, buffer_terminal = [], [], [], [], []
                 t = 0
+
+            buffer_s.append(s)
+            buffer_a.append(a)
+            buffer_v.append(v)
+            buffer_terminal.append(terminal)
+            ep_a.append(a)
+
+            if not ppo.discrete:
+                a = np.clip(a, -ppo.a_bound, ppo.a_bound)
+            s, r, terminal, _ = env.step(a)
+            buffer_r.append(r)
+
+            ep_r += r
+            ep_t += 1
+            t += 1
 
             if terminal:
                 print('Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
@@ -337,21 +361,6 @@ if __name__ == '__main__':
                     print('Saved model at episode', episode, 'in', path)
 
                 break
-
-            buffer_s.append(s)
-            buffer_a.append(a)
-            buffer_v.append(v)
-            buffer_terminal.append(terminal)
-            ep_a.append(a)
-
-            if not ppo.discrete:
-                a = np.clip(a, -ppo.a_bound, ppo.a_bound)
-            s, r, terminal, _ = env.step(a)
-            buffer_r.append(r)
-
-            ep_r += r
-            ep_t += 1
-            t += 1
 
     env.close()
 

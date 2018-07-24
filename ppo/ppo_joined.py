@@ -12,30 +12,31 @@ import tensorflow as tf
 import numpy as np
 import gym
 import os
-import scipy.signal
 from gym import wrappers
 from datetime import datetime
 from time import time
+from utils import *
 OUTPUT_RESULTS_DIR = "./"
 
 EP_MAX = 10000
 GAMMA = 0.99
 LAMBDA = 0.95
-ENTROPY_BETA = 0.0
+ENTROPY_BETA = 0.01  # 0.01 for discrete, 0.0 for continuous
 LR = 0.0001
-BATCH = 2048
+BATCH = 8192  # 128 for discrete, 8192 for continuous
 MINIBATCH = 32
-EPOCHS = 5
+EPOCHS = 10
 EPSILON = 0.1
 VF_COEFF = 1.0
 L2_REG = 0.001
 SIGMA_FLOOR = 0.0
 
+# MODEL_RESTORE_PATH = "/path/to/saved/model"
 MODEL_RESTORE_PATH = None
 
 
 class PPO(object):
-    def __init__(self, environment, summary_dir="./", gpu=False):
+    def __init__(self, environment, summary_dir="./", gpu=False, greyscale=True):
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
         config = tf.ConfigProto(log_device_placement=False, device_count={'GPU': gpu})
         config.gpu_options.per_process_gpu_memory_fraction = 0.1
@@ -50,6 +51,7 @@ class PPO(object):
             self.s_dim, self.a_dim = environment.observation_space.shape, environment.action_space.n
             self.actions = tf.placeholder(tf.int32, [None, 1], 'action')
         self.cnn = len(self.s_dim) == 3
+        self.greyscale = greyscale  # If not greyscale and using RGB, make sure to divide the images by 255
 
         self.sess = tf.Session(config=config)
         self.state = tf.placeholder(tf.float32, [None] + list(self.s_dim), 'state')
@@ -87,7 +89,6 @@ class PPO(object):
                 tf.summary.scalar("loss", loss_pi)
 
             with tf.variable_scope('value_function'):
-                # Sometimes values clipping helps, sometimes just using raw residuals is better ¯\_(ツ)_/¯
                 clipped_value_estimate = vf_old + tf.clip_by_value(self.v - vf_old, -epsilon_decay, epsilon_decay)
                 loss_vf1 = tf.squared_difference(clipped_value_estimate, batch["rewards"])
                 loss_vf2 = tf.squared_difference(self.v, batch["rewards"])
@@ -108,7 +109,7 @@ class PPO(object):
             self.train_op = opt.minimize(loss, global_step=self.global_step, var_list=params)
 
             # grads, vs = zip(*opt.compute_gradients(loss, var_list=params))
-            # grads, _ = tf.clip_by_global_norm(grads, 10.0)
+            # grads, _ = tf.clip_by_global_norm(grads, 1.0)
             # self.train_op = opt.apply_gradients(zip(grads, vs), global_step=self.global_step)
 
         with tf.variable_scope('update_old'):
@@ -152,21 +153,22 @@ class PPO(object):
 
         with tf.variable_scope(name, reuse=reuse):
             if self.cnn:
-                scaled = tf.cast(state_in, tf.float32) / 255.
-                conv1 = tf.layers.conv2d(inputs=scaled, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
+                if self.greyscale:
+                    state_in = tf.image.rgb_to_grayscale(state_in)
+                conv1 = tf.layers.conv2d(inputs=state_in, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
                 conv2 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=4, strides=2, activation=tf.nn.relu)
                 conv3 = tf.layers.conv2d(inputs=conv2, filters=64, kernel_size=3, strides=1, activation=tf.nn.relu)
                 state_in = tf.layers.flatten(conv3)
 
-            l1 = tf.layers.dense(state_in, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l1")
-            l2 = tf.layers.dense(l1, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l2")
-            vf = tf.layers.dense(l2, 1, kernel_regularizer=w_reg, name="vf_output")
+            layer_1 = tf.layers.dense(state_in, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l1")
+            layer_2 = tf.layers.dense(layer_1, 400, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l2")
+            vf = tf.layers.dense(layer_2, 1, kernel_regularizer=w_reg, name="vf_output")
 
             if self.discrete:
-                a_logits = tf.layers.dense(l2, self.a_dim, tf.nn.softmax, kernel_regularizer=w_reg, name="pi_logits")
+                a_logits = tf.layers.dense(layer_2, self.a_dim, kernel_regularizer=w_reg, name="pi_logits")
                 dist = tf.distributions.Categorical(logits=a_logits)
             else:
-                mu = tf.layers.dense(l2, self.a_dim, tf.nn.tanh, kernel_regularizer=w_reg, name="pi_mu")
+                mu = tf.layers.dense(layer_2, self.a_dim, tf.nn.tanh, kernel_regularizer=w_reg, name="pi_mu")
                 log_sigma = tf.get_variable(name="pi_sigma", shape=self.a_dim, initializer=tf.zeros_initializer())
                 dist = tf.distributions.Normal(loc=mu * self.a_bound, scale=tf.maximum(tf.exp(log_sigma), SIGMA_FLOOR))
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
@@ -180,91 +182,51 @@ class PPO(object):
         return action[0], np.squeeze(value)
 
 
-def add_histogram(writer, tag, values, step, bins=1000):
-    """
-    Logs the histogram of a list/vector of values.
-    From: https://gist.github.com/gyglim/1f8dfb1b5c82627ae3efcfbbadb9f514
-    """
-
-    # Create histogram using numpy
-    counts, bin_edges = np.histogram(values, bins=bins)
-
-    # Fill fields of histogram proto
-    hist = tf.HistogramProto()
-    hist.min = float(np.min(values))
-    hist.max = float(np.max(values))
-    hist.num = int(np.prod(values.shape))
-    hist.sum = float(np.sum(values))
-    hist.sum_squares = float(np.sum(values ** 2))
-
-    # Requires equal number as bins, where the first goes from -DBL_MAX to bin_edges[1]
-    # See https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/framework/summary.proto#L30
-    # Therefore we drop the start of the first bin
-    bin_edges = bin_edges[1:]
-
-    # Add bin edges and counts
-    for edge in bin_edges:
-        hist.bucket_limit.append(edge)
-    for c in counts:
-        hist.bucket.append(c)
-
-    # Create and write Summary
-    summary = tf.Summary(value=[tf.Summary.Value(tag=tag, histo=hist)])
-    writer.add_summary(summary, step)
-
-
-def discount(x, gamma, terminal_array=None):
-    if terminal_array is None:
-        return scipy.signal.lfilter([1], [1, -gamma], x[::-1], axis=0)[::-1]
-    else:
-        y, adv = 0, []
-        terminals_reversed = terminal_array[1:][::-1]
-        for step, dt in enumerate(reversed(x)):
-            y = dt + gamma * y * (1 - terminals_reversed[step])
-            adv.append(y)
-        return np.array(adv)[::-1]
-
-
 if __name__ == '__main__':
     # Discrete environments
-    # ENVIRONMENT = 'CartPole-v1'
+    # ENVIRONMENT = 'CartPole-v1'  # Switch off reward scaling for this
     # ENVIRONMENT = 'MountainCar-v0'
-    ENVIRONMENT = 'LunarLander-v2'
-    # ENVIRONMENT = 'MsPacman-v0'
+    # ENVIRONMENT = 'LunarLander-v2'
+    # ENVIRONMENT = 'Pong-v0'
 
     # Continuous environments
     # ENVIRONMENT = 'Pendulum-v0'
     # ENVIRONMENT = 'MountainCarContinuous-v0'
     # ENVIRONMENT = 'LunarLanderContinuous-v2'
-    # ENVIRONMENT = 'BipedalWalker-v2'
+    ENVIRONMENT = 'BipedalWalker-v2'
     # ENVIRONMENT = 'BipedalWalkerHardcore-v2'
     # ENVIRONMENT = 'CarRacing-v0'
 
     TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
-    SUMMARY_DIR = os.path.join(OUTPUT_RESULTS_DIR, "PPO_Joined", ENVIRONMENT, TIMESTAMP)
+    SUMMARY_DIR = os.path.join(OUTPUT_RESULTS_DIR, "PPO", ENVIRONMENT, TIMESTAMP)
 
     env = gym.make(ENVIRONMENT)
     env = wrappers.Monitor(env, os.path.join(SUMMARY_DIR, ENVIRONMENT), video_callable=None)
-    ppo = PPO(env, SUMMARY_DIR)
+    ppo = PPO(env, SUMMARY_DIR, gpu=False)
 
     if MODEL_RESTORE_PATH is not None:
         ppo.restore_model(MODEL_RESTORE_PATH)
 
-    t = 0
+    t, terminal = 0, False
     buffer_s, buffer_a, buffer_r, buffer_v, buffer_terminal = [], [], [], [], []
+    rolling_r = RunningStats()
 
     for episode in range(EP_MAX + 1):
+
         s = env.reset()
-        ep_r, ep_t, terminal = 0, 0, False
-        ep_a = []
+        ep_r, ep_t, ep_a = 0, 0, []
 
         while True:
             a, v = ppo.evaluate_state(s)
 
             # Update ppo
             if t == BATCH:  # or (terminal and t < BATCH):
-                v_final = [v * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
+                # Normalise rewards
                 rewards = np.array(buffer_r)
+                rolling_r.update(rewards)
+                rewards = np.clip(rewards / rolling_r.std, -10, 10)
+
+                v_final = [v * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
                 values = np.array(buffer_v + v_final)
                 terminals = np.array(buffer_terminal + [terminal])
 
@@ -281,12 +243,29 @@ if __name__ == '__main__':
                 buffer_s, buffer_a, buffer_r, buffer_v, buffer_terminal = [], [], [], [], []
                 t = 0
 
+            buffer_s.append(s)
+            buffer_a.append(a)
+            buffer_v.append(v)
+            buffer_terminal.append(terminal)
+            ep_a.append(a)
+
+            if not ppo.discrete:
+                a = np.clip(a, -ppo.a_bound, ppo.a_bound)
+            s, r, terminal, _ = env.step(a)
+            buffer_r.append(r)
+
+            ep_r += r
+            ep_t += 1
+            t += 1
+
             if terminal:
                 print('Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
 
                 # End of episode summary
                 worker_summary = tf.Summary()
                 worker_summary.value.add(tag="Reward", simple_value=ep_r)
+                worker_summary.value.add(tag="Reward/mean", simple_value=rolling_r.mean)
+                worker_summary.value.add(tag="Reward/std", simple_value=rolling_r.std)
 
                 # Create Action histograms for each dimension
                 actions = np.array(ep_a)
@@ -309,21 +288,6 @@ if __name__ == '__main__':
                     print('Saved model at episode', episode, 'in', path)
 
                 break
-
-            buffer_s.append(s)
-            buffer_a.append(a)
-            buffer_v.append(v)
-            buffer_terminal.append(terminal)
-            ep_a.append(a)
-
-            if not ppo.discrete:
-                a = np.clip(a, -ppo.a_bound, ppo.a_bound)
-            s, r, terminal, _ = env.step(a)
-            buffer_r.append(r)
-
-            ep_r += r
-            ep_t += 1
-            t += 1
 
     env.close()
 

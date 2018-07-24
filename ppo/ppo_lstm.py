@@ -1,5 +1,5 @@
 """
-A simple version of Proximal Policy Optimization (ppo) using single thread and an LSTM layer.
+A simple version of Proximal Policy Optimization (PPO) using single thread and an LSTM layer.
 
 Based on:
 1. Emergence of Locomotion Behaviours in Rich Environments (Google Deepmind): [https://arxiv.org/abs/1707.02286]
@@ -16,30 +16,31 @@ import scipy.signal
 from gym import wrappers
 from datetime import datetime
 from time import time
+from utils import *
 OUTPUT_RESULTS_DIR = "./"
 
 EP_MAX = 10000
 GAMMA = 0.99
 LAMBDA = 0.95
-ENTROPY_BETA = 0.0
-LR = 0.00005
+ENTROPY_BETA = 0.01  # 0.01 for discrete, 0.0 for continuous
+LR = 0.0001
 BATCH = 8192
 MINIBATCH = 32
 EPOCHS = 10
 EPSILON = 0.1
 VF_COEFF = 1.0
 L2_REG = 0.001
-LSTM_UNITS = 128
+LSTM_UNITS = 256
 LSTM_LAYERS = 1
 KEEP_PROB = 0.8
 SIGMA_FLOOR = 0.1  # Useful to set this to a non-zero number since the LSTM can make sigma drop too quickly
 
-# MODEL_RESTORE_PATH = "/mnt/sdb1/rl-examples/PPO_LSTM/Pendulum-v0/20180523-193806"
+# MODEL_RESTORE_PATH = "/path/to/saved/model"
 MODEL_RESTORE_PATH = None
 
 
 class PPO(object):
-    def __init__(self, environment, summary_dir="./", gpu=False):
+    def __init__(self, environment, summary_dir="./", gpu=False, greyscale=True):
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
         config = tf.ConfigProto(log_device_placement=False, device_count={'GPU': gpu})
         config.gpu_options.per_process_gpu_memory_fraction = 0.1
@@ -54,6 +55,7 @@ class PPO(object):
             self.s_dim, self.a_dim = environment.observation_space.shape, environment.action_space.n
             self.actions = tf.placeholder(tf.int32, [None, 1], 'action')
         self.cnn = len(self.s_dim) == 3
+        self.greyscale = greyscale  # If not greyscale and using RGB, make sure to divide the images by 255
 
         self.sess = tf.Session(config=config)
         self.state = tf.placeholder(tf.float32, [None] + list(self.s_dim), 'state')
@@ -64,7 +66,9 @@ class PPO(object):
         # Use the TensorFlow Dataset API
         self.dataset = tf.data.Dataset.from_tensor_slices({"state": self.state, "actions": self.actions,
                                                            "rewards": self.rewards, "advantage": self.advantage})
-        self.dataset = self.dataset.batch(MINIBATCH)
+        # self.dataset = self.dataset.batch(MINIBATCH)
+        # Trim to round minibatches
+        self.dataset = self.dataset.apply(tf.contrib.data.batch_and_drop_remainder(MINIBATCH))
         self.iterator = self.dataset.make_initializable_iterator()
         batch = self.iterator.get_next()
         self.global_step = tf.train.get_or_create_global_step()
@@ -81,10 +85,10 @@ class PPO(object):
 
         self.sample_op = tf.squeeze(pi_eval.sample(1), axis=0, name="sample_action")
         self.eval_action = pi_eval.mode()  # Used mode for discrete case. Mode should equal mean in continuous
-        self.saver = tf.train.Saver(max_to_keep=100)
+        self.saver = tf.train.Saver()  # set max_to+keep to keep older checkpoints
 
         with tf.variable_scope('loss'):
-            epsilon_decay = tf.train.polynomial_decay(EPSILON, self.global_step, 1e5, 0.01, power=0.0)
+            epsilon_decay = tf.train.polynomial_decay(EPSILON, self.global_step, 1e6, 0.01, power=0.0)
 
             with tf.variable_scope('policy'):
                 # Use floor functions for the probabilities to prevent NaNs when prob = 0
@@ -115,6 +119,7 @@ class PPO(object):
             opt = tf.train.AdamOptimizer(LR)
             self.train_op = opt.minimize(loss, global_step=self.global_step, var_list=pi_params + vf_params)
 
+            # Gradient clipping
             # grads, vs = zip(*opt.compute_gradients(loss, var_list=pi_params + vf_params))
             # Need to split the two networks so that clip_by_global_norm works properly
             # pi_grads, pi_vs = grads[:len(pi_params)], vs[:len(pi_params)]
@@ -140,12 +145,13 @@ class PPO(object):
         self.summarise = tf.summary.merge(tf.get_collection(tf.GraphKeys.SUMMARIES))
 
     def _build_anet(self, state_in, name, reuse=False, batch_size=MINIBATCH):
-        w_reg = tf.contrib.layers.l2_regularizer(L2_REG)
+        w_reg = None
 
         with tf.variable_scope(name, reuse=reuse):
             if self.cnn:
-                scaled = tf.cast(state_in, tf.float32) / 255.
-                conv1 = tf.layers.conv2d(inputs=scaled, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
+                if self.greyscale:
+                    state_in = tf.image.rgb_to_grayscale(state_in)
+                conv1 = tf.layers.conv2d(inputs=state_in, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
                 conv2 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=4, strides=2, activation=tf.nn.relu)
                 conv3 = tf.layers.conv2d(inputs=conv2, filters=64, kernel_size=3, strides=1, activation=tf.nn.relu)
                 state_in = tf.layers.flatten(conv3)
@@ -179,8 +185,9 @@ class PPO(object):
 
         with tf.variable_scope(name, reuse=reuse):
             if self.cnn:
-                scaled = tf.cast(state_in, tf.float32) / 255.
-                conv1 = tf.layers.conv2d(inputs=scaled, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
+                if self.greyscale:
+                    state_in = tf.image.rgb_to_grayscale(state_in)
+                conv1 = tf.layers.conv2d(inputs=state_in, filters=32, kernel_size=8, strides=4, activation=tf.nn.relu)
                 conv2 = tf.layers.conv2d(inputs=conv1, filters=64, kernel_size=4, strides=2, activation=tf.nn.relu)
                 conv3 = tf.layers.conv2d(inputs=conv2, filters=64, kernel_size=3, strides=1, activation=tf.nn.relu)
                 state_in = tf.layers.flatten(conv3)
@@ -211,20 +218,13 @@ class PPO(object):
         self.saver.restore(self.sess, os.path.join(model_path, "model.ckpt"))
         print("Model restored from", model_path)
 
-    def update(self, exp):
+    def update(self, episode_rollouts):
         start, e_time = time(), []
         self.sess.run([self.update_pi_old_op, self.update_vf_old_op])
 
         for _ in range(EPOCHS):
-            np.random.shuffle(exp)
-            for ep_s, ep_a, ep_r, ep_adv in exp:
-
-                # Trim down to round minibatches
-                trim_index = (ep_s.shape[0] // MINIBATCH) * MINIBATCH
-                ep_s = ep_s[:trim_index]
-                ep_a = ep_a[:trim_index]
-                ep_r = ep_r[:trim_index]
-                ep_adv = ep_adv[:trim_index]
+            np.random.shuffle(episode_rollouts)
+            for ep_s, ep_a, ep_r, ep_adv in episode_rollouts:
 
                 self.sess.run(self.iterator.initializer, feed_dict={self.state: ep_s, self.actions: ep_a,
                                                                     self.rewards: ep_r, self.advantage: ep_adv})
@@ -291,33 +291,6 @@ def add_histogram(writer, tag, values, step, bins=1000):
     writer.add_summary(summary, step)
 
 
-class RunningStats(object):
-    # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
-    # https://github.com/openai/baselines/blob/master/baselines/common/running_mean_std.py
-    def __init__(self, epsilon=1e-4, shape=()):
-        self.mean = np.zeros(shape, 'float64')
-        self.var = np.ones(shape, 'float64')
-        self.count = epsilon
-
-    def update(self, x):
-        batch_mean = np.mean(x, axis=0)
-        batch_var = np.var(x, axis=0)
-        batch_count = x.shape[0]
-        self.update_from_moments(batch_mean, batch_var, batch_count)
-
-    def update_from_moments(self, batch_mean, batch_var, batch_count):
-        delta = batch_mean - self.mean
-        new_mean = self.mean + delta * batch_count / (self.count + batch_count)
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / (self.count + batch_count)
-        new_var = M2 / (self.count + batch_count)
-
-        self.mean = new_mean
-        self.var = new_var
-        self.count = batch_count + self.count
-
-
 def discount(x, gamma, terminal_array=None):
     if terminal_array is None:
         return scipy.signal.lfilter([1], [1, -gamma], x[::-1], axis=0)[::-1]
@@ -335,13 +308,13 @@ if __name__ == '__main__':
     # ENVIRONMENT = 'CartPole-v1'
     # ENVIRONMENT = 'MountainCar-v0'
     # ENVIRONMENT = 'LunarLander-v2'
-    # ENVIRONMENT = 'Breakout-v0'
+    # ENVIRONMENT = 'Pong-v0'
 
     # Continuous environments
-    ENVIRONMENT = 'Pendulum-v0'
+    # ENVIRONMENT = 'Pendulum-v0'
     # ENVIRONMENT = 'MountainCarContinuous-v0'
     # ENVIRONMENT = 'LunarLanderContinuous-v2'
-    # ENVIRONMENT = 'BipedalWalker-v2'
+    ENVIRONMENT = 'BipedalWalker-v2'  # This seems to work best with per episode advantage norm
     # ENVIRONMENT = 'BipedalWalkerHardcore-v2'
     # ENVIRONMENT = 'CarRacing-v0'
 
@@ -350,30 +323,33 @@ if __name__ == '__main__':
 
     env = gym.make(ENVIRONMENT)
     env = wrappers.Monitor(env, os.path.join(SUMMARY_DIR, ENVIRONMENT), video_callable=None)
-    ppo = PPO(env, SUMMARY_DIR)
+    ppo = PPO(env, SUMMARY_DIR, gpu=True)
 
     if MODEL_RESTORE_PATH is not None:
         ppo.restore_model(MODEL_RESTORE_PATH)
 
-    t = 0
+    t, terminal = 0, False
     buffer_s, buffer_a, buffer_r, buffer_v, buffer_terminal = [], [], [], [], []
-    experience = []
-    stats = RunningStats()
+    experience, batch_rewards = [], []
+    rolling_r = RunningStats()
 
     for episode in range(EP_MAX + 1):
 
         lstm_state = ppo.sess.run([ppo.pi_eval_i_state, ppo.vf_eval_i_state])  # Zero LSTM state
 
         s = env.reset()
-        ep_r, ep_t, terminal = 0, 0, False
-        ep_a = []
+        ep_r, ep_t, ep_a = 0, 0, []
 
         while True:
             a, v, lstm_state = ppo.evaluate_state(s, lstm_state)
 
             if terminal:
-                v_final = [v * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
+                # Normalise rewards
                 rewards = np.array(buffer_r)
+                rewards = np.clip(rewards / rolling_r.std, -10, 10)
+                batch_rewards = batch_rewards + buffer_r
+
+                v_final = [v * (1 - terminal)]  # v = 0 if terminal, otherwise use the predicted v
                 values = np.array(buffer_v + v_final)
                 terminals = np.array(buffer_terminal + [terminal])
 
@@ -397,10 +373,29 @@ if __name__ == '__main__':
                     for x in experience:
                         x[3] = (x[3] - np.mean(advs)) / np.maximum(np.std(advs), 1e-6)
 
-                    # print("Training using %i episodes and %i steps..." % (len(experience), t))
-                    graph_summary = ppo.update(experience)
-                    t, experience = 0, []
+                    # Update rolling reward stats
+                    rolling_r.update(np.array(batch_rewards))
 
+                    print("Training using %i episodes and %i steps..." % (len(experience), t))
+                    graph_summary = ppo.update(experience)
+                    t, experience, batch_rewards = 0, [], []
+
+            buffer_s.append(s)
+            buffer_a.append(a)
+            buffer_v.append(v)
+            buffer_terminal.append(terminal)
+            ep_a.append(a)
+
+            if not ppo.discrete:
+                a = np.clip(a, -ppo.a_bound, ppo.a_bound)
+            s, r, terminal, _ = env.step(a)
+            buffer_r.append(r)
+
+            ep_r += r
+            ep_t += 1
+            t += 1
+
+            if terminal:
                 # End of episode summary
                 print('Episode: %i' % episode, "| Reward: %.2f" % ep_r, '| Steps: %i' % ep_t)
 
@@ -427,21 +422,6 @@ if __name__ == '__main__':
                     path = ppo.save_model(SUMMARY_DIR, episode)
                     print('Saved model at episode', episode, 'in', path)
                 break
-
-            buffer_s.append(s)
-            buffer_a.append(a)
-            buffer_v.append(v)
-            buffer_terminal.append(terminal)
-            ep_a.append(a)
-
-            if not ppo.discrete:
-                a = np.clip(a, -ppo.a_bound, ppo.a_bound)
-            s, r, terminal, _ = env.step(a)
-            buffer_r.append(r)
-
-            ep_r += r
-            ep_t += 1
-            t += 1
 
     env.close()
 
