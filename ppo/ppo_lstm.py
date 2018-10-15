@@ -48,7 +48,7 @@ class PPO(object):
         if len(environment.action_space.shape) > 0:
             self.discrete = False
             self.s_dim, self.a_dim = environment.observation_space.shape, environment.action_space.shape[0]
-            self.a_bound = environment.action_space.high
+            self.a_bound = (environment.action_space.high - environment.action_space.low) / 2
             self.actions = tf.placeholder(tf.float32, [None, self.a_dim], 'action')
         else:
             self.discrete = True

@@ -113,7 +113,7 @@ class OUNoise:
 class DDPG:
     def __init__(self, environment):
         self.s_dim, self.a_dim = environment.observation_space.shape[0], environment.action_space.shape[0]
-        self.a_bound = environment.action_space.high
+        self.a_bound = (environment.action_space.high - environment.action_space.low) / 2
 
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
         config = tf.ConfigProto(log_device_placement=False, device_count={'GPU': 0})  # 1 for GPU, 0 for CPU
