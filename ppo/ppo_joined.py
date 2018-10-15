@@ -15,7 +15,7 @@ import os
 from gym import wrappers
 from datetime import datetime
 from time import time
-from utils import *
+from utils import RunningStats, discount, add_histogram
 OUTPUT_RESULTS_DIR = "./"
 
 EP_MAX = 10000

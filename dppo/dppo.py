@@ -19,7 +19,7 @@ import scipy.signal
 from time import time
 from gym import wrappers
 from tensorflow.python.training.summary_io import SummaryWriterCache
-from utils import *
+from utils import RunningStats, discount, add_histogram
 OUTPUT_RESULTS_DIR = "./"
 
 
@@ -237,39 +237,6 @@ class Worker(object):
                 self.env = wrappers.Monitor(self.env, os.path.join(SUMMARY_DIR, ENVIRONMENT), video_callable=None)
             self.ppo = PPO(self.env, self.wid)
 
-    @staticmethod
-    def add_histogram(writer, tag, values, step, bins=1000):
-        """
-        Logs the histogram of a list/vector of values.
-        From: https://gist.github.com/gyglim/1f8dfb1b5c82627ae3efcfbbadb9f514
-        """
-
-        # Create histogram using numpy
-        counts, bin_edges = np.histogram(values, bins=bins)
-
-        # Fill fields of histogram proto
-        hist = tf.HistogramProto()
-        hist.min = float(np.min(values))
-        hist.max = float(np.max(values))
-        hist.num = int(np.prod(values.shape))
-        hist.sum = float(np.sum(values))
-        hist.sum_squares = float(np.sum(values ** 2))
-
-        # Requires equal number as bins, where the first goes from -DBL_MAX to bin_edges[1]
-        # See https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/framework/summary.proto#L30
-        # Therefore we drop the start of the first bin
-        bin_edges = bin_edges[1:]
-
-        # Add bin edges and counts
-        for edge in bin_edges:
-            hist.bucket_limit.append(edge)
-        for c in counts:
-            hist.bucket.append(c)
-
-        # Create and write Summary
-        summary = tf.Summary(value=[tf.Summary.Value(tag=tag, histo=hist)])
-        writer.add_summary(summary, step)
-
     def work(self):
         hooks = [self.ppo.sync_replicas_hook]
         sess = tf.train.MonitoredTrainingSession(master=self.server.target, is_chief=(self.wid == 0),
@@ -341,10 +308,10 @@ class Worker(object):
                         # Create Action histograms for each dimension
                         actions = np.array(ep_a)
                         if self.ppo.discrete:
-                            self.add_histogram(writer, "Action", actions, episode, bins=self.ppo.a_dim)
+                            add_histogram(writer, "Action", actions, episode, bins=self.ppo.a_dim)
                         else:
                             for a in range(self.ppo.a_dim):
-                                self.add_histogram(writer, "Action/Dim" + str(a), actions[:, a], episode)
+                                add_histogram(writer, "Action/Dim" + str(a), actions[:, a], episode)
 
                         try:
                             writer.add_summary(graph_summary, episode)

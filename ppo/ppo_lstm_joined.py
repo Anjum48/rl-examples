@@ -17,7 +17,7 @@ import scipy.signal
 from gym import wrappers
 from datetime import datetime
 from time import time
-from utils import *
+from utils import RunningStats, discount, add_histogram
 OUTPUT_RESULTS_DIR = "./"
 
 
@@ -68,9 +68,7 @@ class PPO(object):
         # Use the TensorFlow Dataset API
         self.dataset = tf.data.Dataset.from_tensor_slices({"state": self.state, "actions": self.actions,
                                                            "rewards": self.rewards, "advantage": self.advantage})
-        # self.dataset = self.dataset.batch(MINIBATCH)
-        # Trim to round minibatches
-        self.dataset = self.dataset.apply(tf.contrib.data.batch_and_drop_remainder(MINIBATCH))
+        self.dataset = self.dataset.batch(MINIBATCH, drop_remainder=True)
         self.iterator = self.dataset.make_initializable_iterator()
         batch = self.iterator.get_next()
         self.global_step = tf.train.get_or_create_global_step()
@@ -149,7 +147,7 @@ class PPO(object):
             layer2 = tf.layers.dense(layer1, LSTM_UNITS, tf.nn.relu, kernel_regularizer=w_reg, name="l2")
 
             # LSTM layer
-            lstm = tf.nn.rnn_cell.BasicLSTMCell(num_units=LSTM_UNITS)
+            lstm = tf.nn.rnn_cell.LSTMCell(num_units=LSTM_UNITS, name='basic_lstm_cell')
             lstm = tf.nn.rnn_cell.DropoutWrapper(lstm, output_keep_prob=self.keep_prob)
             lstm = tf.nn.rnn_cell.MultiRNNCell(cells=[lstm] * LSTM_LAYERS)
 

@@ -29,15 +29,24 @@ This sometimes achieved higher scores in some environments, but can have stabili
 These scripts are suffixed, e.g. `ppo_joined.py`
 
 ## Training
-All the Python scripts are written as standalone scripts. Just run them
-as you would for a single file or in your IDE. The models
-and TensorBoard summaries are saved in the same directory as the script.
-DPPO has a helper script to set off the worker threads
+All the Python scripts are written as standalone scripts (but share some common functions in `utils.py`). 
+Just run them directly in your IDE. Or in a terminal using the `-m` flag:
+
+```
+rl-examples$ python3 -m ppo.ppo_joined
+```
+
+The models and TensorBoard summaries are saved in the same directory as the script.
+DPPO has a helper script to set off the worker threads:
+
+```
+rl-examples$ sh dppo/start_dppo.sh
+```
 
 ## Requirements
-- Python 3.5+
+- Python 3.6+
 - OpenAI Gym 0.10.3+
-- TensorFlow 1.6
+- TensorFlow 1.11
 - Numpy 1.13+
 
 DPPO was tested on a 16 core machine using CPU only, so the helper

@@ -15,11 +15,10 @@ import tensorflow as tf
 import numpy as np
 import gym
 import os
-import scipy.signal
 from time import time
 from gym import wrappers
 from tensorflow.python.training.summary_io import SummaryWriterCache
-from utils import *
+from utils import RunningStats, discount, add_histogram
 OUTPUT_RESULTS_DIR = "./"
 
 
@@ -65,9 +64,7 @@ class PPO(object):
         # Use the TensorFlow Dataset API
         self.dataset = tf.data.Dataset.from_tensor_slices({"state": self.state, "actions": self.actions,
                                                            "rewards": self.rewards, "advantage": self.advantage})
-        # self.dataset = self.dataset.batch(MINIBATCH)
-        # Trim to round minibatches
-        self.dataset = self.dataset.apply(tf.contrib.data.batch_and_drop_remainder(MINIBATCH))
+        self.dataset = self.dataset.batch(MINIBATCH, drop_remainder=True)
         self.iterator = self.dataset.make_initializable_iterator()
         batch = self.iterator.get_next()
         self.global_step = tf.train.get_or_create_global_step()
@@ -156,7 +153,7 @@ class PPO(object):
             l2 = tf.layers.dense(l1, LSTM_UNITS, tf.nn.relu, kernel_regularizer=w_reg, name="pi_l2")
 
             # LSTM layer
-            a_lstm = tf.nn.rnn_cell.BasicLSTMCell(num_units=LSTM_UNITS)
+            a_lstm = tf.nn.rnn_cell.LSTMCell(num_units=LSTM_UNITS, name='basic_lstm_cell')
             a_lstm = tf.nn.rnn_cell.DropoutWrapper(a_lstm, output_keep_prob=self.keep_prob, seed=42)
             a_lstm = tf.nn.rnn_cell.MultiRNNCell(cells=[a_lstm] * LSTM_LAYERS)
 
@@ -192,7 +189,7 @@ class PPO(object):
             l2 = tf.layers.dense(l1, LSTM_UNITS, tf.nn.relu, kernel_regularizer=w_reg, name="vf_l2")
 
             # LSTM layer
-            c_lstm = tf.nn.rnn_cell.BasicLSTMCell(num_units=LSTM_UNITS)
+            c_lstm = tf.nn.rnn_cell.LSTMCell(num_units=LSTM_UNITS, name='basic_lstm_cell')
             c_lstm = tf.nn.rnn_cell.DropoutWrapper(c_lstm, output_keep_prob=self.keep_prob, seed=42)
             c_lstm = tf.nn.rnn_cell.MultiRNNCell([c_lstm] * LSTM_LAYERS)
 
@@ -266,39 +263,6 @@ class Worker(object):
                 self.env = wrappers.Monitor(self.env, os.path.join(SUMMARY_DIR, ENVIRONMENT), video_callable=None)
             self.ppo = PPO(self.env, self.wid)
 
-    @staticmethod
-    def add_histogram(writer, tag, values, step, bins=1000):
-        """
-        Logs the histogram of a list/vector of values.
-        From: https://gist.github.com/gyglim/1f8dfb1b5c82627ae3efcfbbadb9f514
-        """
-
-        # Create histogram using numpy
-        counts, bin_edges = np.histogram(values, bins=bins)
-
-        # Fill fields of histogram proto
-        hist = tf.HistogramProto()
-        hist.min = float(np.min(values))
-        hist.max = float(np.max(values))
-        hist.num = int(np.prod(values.shape))
-        hist.sum = float(np.sum(values))
-        hist.sum_squares = float(np.sum(values ** 2))
-
-        # Requires equal number as bins, where the first goes from -DBL_MAX to bin_edges[1]
-        # See https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/framework/summary.proto#L30
-        # Therefore we drop the start of the first bin
-        bin_edges = bin_edges[1:]
-
-        # Add bin edges and counts
-        for edge in bin_edges:
-            hist.bucket_limit.append(edge)
-        for c in counts:
-            hist.bucket.append(c)
-
-        # Create and write Summary
-        summary = tf.Summary(value=[tf.Summary.Value(tag=tag, histo=hist)])
-        writer.add_summary(summary, step)
-
     def work(self):
         hooks = [self.ppo.sync_replicas_hook]
         sess = tf.train.MonitoredTrainingSession(master=self.server.target, is_chief=(self.wid == 0),
@@ -369,10 +333,10 @@ class Worker(object):
                         # Create Action histograms for each dimension
                         actions = np.array(ep_a)
                         if self.ppo.discrete:
-                            self.add_histogram(writer, "Action", actions, episode, bins=self.ppo.a_dim)
+                            add_histogram(writer, "Action", actions, episode, bins=self.ppo.a_dim)
                         else:
                             for a in range(self.ppo.a_dim):
-                                self.add_histogram(writer, "Action/Dim" + str(a), actions[:, a], episode)
+                                add_histogram(writer, "Action/Dim" + str(a), actions[:, a], episode)
 
                         try:
                             writer.add_summary(graph_summary, episode)
