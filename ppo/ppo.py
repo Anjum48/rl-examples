@@ -280,7 +280,7 @@ if __name__ == '__main__':
             ep_a.append(a)
 
             if not ppo.discrete:
-                a = np.clip(a, -ppo.a_bound, ppo.a_bound)
+                a = np.clip(a, env.action_space.low, env.action_space.high)
             s, r, terminal, _ = env.step(a)
             buffer_r.append(r)
 
@@ -329,7 +329,7 @@ if __name__ == '__main__':
             env.render()
             a, v = ppo.evaluate_state(s, stochastic=False)
             if not ppo.discrete:
-                a = np.clip(a, -ppo.a_bound, ppo.a_bound)
+                a = np.clip(a, env.action_space.low, env.action_space.high)
             s, r, terminal, _ = env.step(a)
             ep_r += r
             ep_t += 1

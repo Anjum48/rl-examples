@@ -354,7 +354,7 @@ class Worker(object):
                 ep_a.append(a)
 
                 if not self.ppo.discrete:
-                    a = np.clip(a, -self.ppo.a_bound, self.ppo.a_bound)
+                    a = np.clip(a, self.env.action_space.low, self.env.action_space.high)
                 s, r, terminal, _ = self.env.step(a)
                 buffer_r.append(r)
 
